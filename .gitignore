@@ -1,0 +1,39 @@
+# Binaries
+hyperi
+hyperi-*
+dist/
+
+# Build artifacts
+build/iso-work/
+
+# Environment
+.env
+.env.local
+*.env
+
+# API keys
+api-key
+/etc/hyperi/api-key
+
+# Runtime data (not committed — lives in /var/lib/hyperi or ~/.hyperi)
+*.jsonl
+sessions/
+capabilities.json
+
+# Go
+*.test
+*.out
+vendor/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Frontend build output (committed for now; move to CI later)
+# ui/frontend/dist/

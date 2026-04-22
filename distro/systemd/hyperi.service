@@ -1,0 +1,26 @@
+[Unit]
+Description=HyperiOS Agent Service
+Documentation=https://github.com/isellar/hyperios
+After=network.target sway.service
+Wants=sway.service
+
+[Service]
+Type=simple
+User=hyperi
+Group=hyperi
+ExecStart=/usr/local/bin/hyperi session start --execute
+WorkingDirectory=/var/lib/hyperi
+Environment=ANTHROPIC_API_KEY_FILE=/etc/hyperi/api-key
+EnvironmentFile=-/etc/hyperi/environment
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/hyperi /var/log/hyperi
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

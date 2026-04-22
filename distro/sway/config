@@ -1,0 +1,65 @@
+# HyperiOS sway compositor configuration
+# Kiosk-mode setup: HyperiOS Shell runs fullscreen in workspace 1.
+# Applications summoned by the agent appear in workspace 2+.
+
+# ── Basics ─────────────────────────────────────────────────────────────────────
+set $mod Mod4
+
+# Use Wayland-native terminal (foot preferred for low latency)
+set $term foot
+
+# ── Output ────────────────────────────────────────────────────────────────────
+# Default output configuration — customise for your hardware
+output * bg #000000 solid_color
+
+# ── Workspaces ────────────────────────────────────────────────────────────────
+# Workspace 1: HyperiOS Shell (always fullscreen)
+# Workspace 2+: Agent-summoned applications
+
+# Launch HyperiOS shell on startup in workspace 1
+exec --no-startup-id swaymsg 'workspace 1; exec foot -e hyperi-shell'
+
+# ── Key bindings ──────────────────────────────────────────────────────────────
+# Voice activation (push-to-talk): hold Super+V
+bindsym $mod+v exec hyperi-listen
+
+# Switch back to HyperiOS shell
+bindsym $mod+1 workspace 1
+
+# Kill focused window
+bindsym $mod+Shift+q kill
+
+# Fullscreen
+bindsym $mod+f fullscreen
+
+# Reload config
+bindsym $mod+Shift+c reload
+
+# Exit sway
+bindsym $mod+Shift+e exec swaymsg exit
+
+# ── IPC ───────────────────────────────────────────────────────────────────────
+# Allow hyperi daemon to control windows via swaymsg
+# The hyperi user must be in the 'sway' group or SWAYSOCK must be accessible.
+
+# ── Status bar ────────────────────────────────────────────────────────────────
+# Minimal bar — shows only workspace indicator
+bar {
+    position top
+    status_command while date +'%H:%M'; do sleep 1; done
+    colors {
+        background #000000
+        statusline #ffffff
+        focused_workspace  #000000 #333333 #ffffff
+        inactive_workspace #000000 #000000 #888888
+    }
+}
+
+# ── Window rules ──────────────────────────────────────────────────────────────
+# Force hyperi shell to always be fullscreen in workspace 1
+for_window [app_id="foot" title="hyperi-shell"] fullscreen enable
+
+# Agent-spawned apps go to workspace 2
+for_window [app_id="firefox"]  move to workspace 2
+for_window [app_id="chromium"] move to workspace 2
+for_window [app_id="gedit"]    move to workspace 2

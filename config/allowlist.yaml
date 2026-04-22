@@ -1,0 +1,71 @@
+version: 1
+
+# Read-only file access within the current workspace
+read:file:
+  - "{workspace}/**"
+
+# Safe read-only shell commands
+execute:shell:
+  - grep
+  - find
+  - cat
+  - head
+  - tail
+  - ls
+  - pwd
+  - wc
+  - sort
+  - uniq
+  - df
+  - du
+  - stat
+  - file
+
+# Read-only git operations
+execute:git:
+  - git:status
+  - git:log
+  - git:diff
+  - git:branch
+
+# Package management — scoped by manager:package
+# Patterns use glob matching: apt:* allows any apt package
+execute:package:
+  - apt:curl
+  - apt:wget
+  - apt:git
+  - apt:vim
+  - apt:htop
+  - apt:tmux
+  - apt:jq
+
+# Service management — scoped by systemctl:action:service
+# Only status queries are pre-approved; start/stop require runtime grants
+execute:process:
+  - systemctl:status:*
+
+# Display/compositor management via swaymsg
+# Pre-approved: workspace switching and window focus
+execute:display:
+  - sway:workspace *
+  - sway:focus *
+
+# Config file writes — paths must be explicitly granted at runtime
+# No pre-approved config paths (all require runtime capability grant)
+execute:config: []
+
+# Network management via nmcli — status queries only pre-approved
+execute:network:
+  - nmcli:device status
+  - nmcli:connection show
+
+# Outbound network — explicit hosts only, no wildcard
+network:outbound:
+  - "api.anthropic.com"
+  - "packages.ubuntu.com"
+  - "archive.ubuntu.com"
+
+# UI open — browser and terminal allowed
+ui:open:
+  - browser
+  - terminal

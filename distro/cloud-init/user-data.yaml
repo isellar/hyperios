@@ -1,0 +1,66 @@
+#cloud-config
+# HyperiOS first-boot provisioning via cloud-init.
+# This runs on first boot of a fresh Ubuntu 24.04 install.
+
+hostname: hyperios
+
+# Create the hyperi system user
+users:
+  - name: hyperi
+    system: true
+    shell: /bin/bash
+    home: /var/lib/hyperi
+    groups: [audio, video, render, seat, input]
+    no-create-home: false
+
+# Install base packages
+packages:
+  - sway
+  - foot
+  - grim
+  - ydotool
+  - curl
+  - git
+  - jq
+  - nmcli
+  - flatpak
+  - systemd-resolved
+
+package_update: true
+package_upgrade: true
+
+# Create required directories
+runcmd:
+  - mkdir -p /var/lib/hyperi/sessions
+  - mkdir -p /var/log/hyperi
+  - mkdir -p /etc/hyperi
+  - chown -R hyperi:hyperi /var/lib/hyperi /var/log/hyperi
+  - chmod 750 /var/lib/hyperi /var/log/hyperi
+
+  # Install hyperi binary (replace with actual release URL)
+  # - curl -Lo /usr/local/bin/hyperi https://github.com/isellar/hyperios/releases/latest/download/hyperi-linux-amd64
+  # - chmod +x /usr/local/bin/hyperi
+
+  # Install sway config
+  - mkdir -p /etc/sway
+  - cp /opt/hyperios/distro/sway/config /etc/sway/config
+
+  # Enable and start services
+  - systemctl enable ydotoold
+  - systemctl enable hyperi
+  - systemctl start ydotoold
+
+write_files:
+  - path: /etc/hyperi/environment
+    permissions: '0640'
+    owner: root:hyperi
+    content: |
+      # HyperiOS environment configuration
+      # Set ANTHROPIC_API_KEY here or in /etc/hyperi/api-key
+      HYPERI_DATA_DIR=/var/lib/hyperi
+      HYPERI_LOG_DIR=/var/log/hyperi
+      WAYLAND_DISPLAY=wayland-1
+
+final_message: |
+  HyperiOS provisioning complete.
+  Set your Anthropic API key in /etc/hyperi/api-key before starting the agent.
