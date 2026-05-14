@@ -680,12 +680,16 @@ func launchShellWithIntent(cfg *config.Config, intent string, _ bool) error {
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
 // resolveDataDir returns the agent data directory.
-// Priority: HYPERI_DATA_DIR env → /var/lib/hyperi (if exists) → ~/.hyperi
+// Priority: HYPERI_DATA_DIR env → /var/lib/hyperi (if accessible) → ~/.hyperi
+//
+// We check accessibility (os.ReadDir), not just existence (os.Stat).
+// /var/lib/hyperi exists on this machine but is owned by the hyperi service user;
+// a regular user running hyperi interactively must fall back to ~/.hyperi.
 func resolveDataDir() string {
 	if d := os.Getenv("HYPERI_DATA_DIR"); d != "" {
 		return d
 	}
-	if _, err := os.Stat("/var/lib/hyperi"); err == nil {
+	if _, err := os.ReadDir("/var/lib/hyperi"); err == nil {
 		return "/var/lib/hyperi"
 	}
 	home, _ := os.UserHomeDir()
@@ -697,7 +701,7 @@ func resolveLogDir() string {
 	if d := os.Getenv("HYPERI_LOG_DIR"); d != "" {
 		return d
 	}
-	if _, err := os.Stat("/var/log/hyperi"); err == nil {
+	if _, err := os.ReadDir("/var/log/hyperi"); err == nil {
 		return "/var/log/hyperi"
 	}
 	return filepath.Join(resolveDataDir(), "logs")
