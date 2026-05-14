@@ -24,6 +24,10 @@ type WindowInfo struct {
 	App   string `json:"app"`
 }
 
+// PipelineRunner is the function the server calls when a user_input arrives
+// over WebSocket. It mirrors shell.PipelineRunner.
+type PipelineRunner func(intent, sessionID string) error
+
 type Server struct {
 	addr           string
 	manager        *session.Manager
@@ -35,6 +39,7 @@ type Server struct {
 	windowMgr      windowLister
 	appController  *AppController
 	previousWindow string
+	pipeline       PipelineRunner // nil if not wired
 }
 
 type websocketConn struct {
@@ -55,6 +60,12 @@ func NewServer(addr string, mgr *session.Manager) *Server {
 		windowMgr:     NewWindowManager(),
 		appController: NewAppController(),
 	}
+}
+
+// SetPipeline attaches a pipeline runner so the web UI can actually execute intents.
+// Must be called before Start().
+func (s *Server) SetPipeline(runner PipelineRunner) {
+	s.pipeline = runner
 }
 
 func (s *Server) SetCurrent(state *session.State) {
@@ -216,23 +227,45 @@ func (s *Server) handleWebSocketMessage(data []byte) {
 }
 
 func (s *Server) handleUserInput(text string) {
-	text = strings.ToLower(strings.TrimSpace(text))
+	trimmed := strings.TrimSpace(text)
+	lower := strings.ToLower(trimmed)
 
-	if strings.HasPrefix(text, "show ") || strings.HasPrefix(text, "show me ") {
-		appName := strings.TrimPrefix(strings.TrimPrefix(text, "show "), "show me ")
+	// Built-in display commands handled without pipeline
+	if strings.HasPrefix(lower, "show ") || strings.HasPrefix(lower, "show me ") {
+		appName := strings.TrimPrefix(strings.TrimPrefix(lower, "show "), "show me ")
 		s.handleShowCommand(appName)
 		return
 	}
-
-	if strings.Contains(text, "switch back") || strings.Contains(text, "go back") {
+	if strings.Contains(lower, "switch back") || strings.Contains(lower, "go back") {
 		s.handleSwitchBack()
 		return
 	}
 
+	// Route all other input to the agent pipeline
+	if s.pipeline != nil && trimmed != "" {
+		s.broadcast(map[string]interface{}{
+			"type":    "session_update",
+			"status":  "processing",
+			"message": "Running: " + trimmed,
+		})
+		// Run in background so the WebSocket handler returns immediately
+		go func() {
+			if err := s.pipeline(trimmed, ""); err != nil {
+				s.broadcast(map[string]interface{}{
+					"type":    "notification",
+					"title":   "Pipeline error",
+					"message": err.Error(),
+				})
+			}
+		}()
+		return
+	}
+
+	// Pipeline not wired — echo back
 	s.broadcast(map[string]interface{}{
 		"type":    "session_update",
 		"status":  "processing",
-		"message": "Processing: " + text,
+		"message": "Processing: " + trimmed,
 	})
 }
 

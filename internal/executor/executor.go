@@ -33,7 +33,7 @@ func New(cfg ExecutorConfig) Executor {
 
 	switch cfg.ExecutorType {
 	case types.ExecutorContainer:
-		return NewContainer(cfg.Registry, cfg.Workspace, cfg.Image)
+		return NewContainerWithBus(cfg.Registry, cfg.Workspace, cfg.Image, cfg.Bus, cfg.SessionID)
 	default:
 		return NewLocal(cfg.Registry, cfg.Workspace, cfg.Bus, cfg.SessionID)
 	}

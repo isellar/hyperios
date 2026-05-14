@@ -3,6 +3,7 @@ package shell
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -83,9 +84,9 @@ type Model struct {
 	lines    []outputLine
 
 	// Pipeline state
-	running    bool
-	sessionID  string
-	runCount   int
+	running   bool
+	sessionID string
+	runCount  int
 
 	// Approval prompt state
 	approval    *approvalRequestMsg
@@ -105,12 +106,12 @@ type Model struct {
 	workspaceDir string
 
 	// Voice (push-to-talk)
-	voiceEnabled    bool
-	voiceModelPath  string
-	voiceCLIPath    string
-	voiceRecording  bool
-	voiceSession    *voice.Session
-	voicePTTKey     string // e.g. "ctrl+space"
+	voiceEnabled   bool
+	voiceModelPath string
+	voiceCLIPath   string
+	voiceRecording bool
+	voiceSession   *voice.Session
+	voicePTTKey    string // e.g. "ctrl+space"
 }
 
 // PipelineRunner is the function the TUI calls when the user submits an intent.
@@ -120,10 +121,10 @@ type PipelineRunner func(intent string, sessionID string) error
 
 // VoiceConfig holds push-to-talk configuration for the TUI.
 type VoiceConfig struct {
-	Enabled    bool
-	ModelPath  string
-	CLIPath    string
-	PTTKey     string // e.g. "ctrl+space"
+	Enabled   bool
+	ModelPath string
+	CLIPath   string
+	PTTKey    string // e.g. "ctrl+space"
 }
 
 // New creates a new TUI Model.
@@ -166,6 +167,9 @@ func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, works
 	return m
 }
 
+// initialIntentMsg is sent on Init when HYPERI_INITIAL_INTENT is set.
+type initialIntentMsg struct{ intent string }
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 func (m Model) Init() tea.Cmd {
@@ -174,6 +178,14 @@ func (m Model) Init() tea.Cmd {
 	}
 	if m.busCh != nil {
 		cmds = append(cmds, waitForBusEvent(m.busCh))
+	}
+	// If an initial intent was passed via environment (from `hyperi session start "..."`),
+	// inject it as the first command after the TUI is ready.
+	if intent := os.Getenv("HYPERI_INITIAL_INTENT"); intent != "" {
+		os.Unsetenv("HYPERI_INITIAL_INTENT")
+		cmds = append(cmds, func() tea.Msg {
+			return initialIntentMsg{intent: intent}
+		})
 	}
 	return tea.Batch(cmds...)
 }
@@ -356,6 +368,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine(outputLine{text: "  (no speech detected)", style: styleGray})
 		}
 		m.refreshViewport()
+
+	case initialIntentMsg:
+		// Pre-queued intent from `hyperi session start "..."` — run it immediately.
+		if !m.running && msg.intent != "" {
+			m.input.SetValue(msg.intent)
+			return m, m.handleInput()
+		}
 
 	case pipelineStartMsg:
 		m.running = true

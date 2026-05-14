@@ -1,33 +1,37 @@
 // Package main is the CLI entry point for HyperiOS.
-// It wires together the full pipeline:
 //
-//	User Intent → Intent Agent → Planner Agent → Adversarial Agent → Policy Arbiter → Executor
+// Primary interface: `hyperi` launches the persistent TUI shell (Phase 2).
+// The TUI wires the full pipeline, event bus, audit trail, plan docs, inotify
+// watcher, and in-process scheduler together.
+//
+// Secondary (headless) interface: `hyperi session start --no-tui [intent]`
+// runs a single pipeline pass without the TUI — useful over SSH or from
+// systemd when no terminal is available.
 package main
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
-	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
-	"github.com/isellar/hyperios/internal/agents"
-	"github.com/isellar/hyperios/internal/arbiter"
+	"github.com/isellar/hyperios/internal/audit"
 	"github.com/isellar/hyperios/internal/bus"
 	"github.com/isellar/hyperios/internal/capability"
 	"github.com/isellar/hyperios/internal/config"
-	"github.com/isellar/hyperios/internal/executor"
-	"github.com/isellar/hyperios/internal/llm"
+	"github.com/isellar/hyperios/internal/manifest"
+	"github.com/isellar/hyperios/internal/plan"
+	"github.com/isellar/hyperios/internal/scheduler"
 	"github.com/isellar/hyperios/internal/session"
-	"github.com/isellar/hyperios/internal/types"
+	"github.com/isellar/hyperios/internal/shell"
 )
 
-// version is set at build time via -ldflags.
+// version is set at build time via -ldflags "-X main.version=x.y.z".
 var version = "dev"
 
 func main() {
@@ -38,24 +42,575 @@ func main() {
 	}
 }
 
-// buildRoot constructs the root cobra command and all sub-commands.
+// ── Root command ──────────────────────────────────────────────────────────────
+
 func buildRoot() *cobra.Command {
+	var cfgPath string
+	var autonomyFlag int
+	autonomyChanged := false
+
 	root := &cobra.Command{
 		Use:   "hyperi",
-		Short: "HyperiOS agent — AI-driven Linux OS interface",
-		Long: `hyperi is the controlling agent of HyperiOS.
-It accepts natural-language intent, plans a sequence of OS actions,
-evaluates them for risk, and executes the arbiter-approved steps.`,
+		Short: "HyperiOS — AI-driven Linux OS interface",
+		Long: `hyperi is the HyperiOS agent shell.
+
+Running without a subcommand launches the persistent TUI shell (Phase 2).
+Type your intent at the prompt; hyperi plans, executes, and reports.
+
+Use subcommands for headless/scripted operation.`,
 		Version: version,
+		// Default action: launch TUI shell
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+			if autonomyChanged {
+				cfg.AutonomyLevel = autonomyFlag
+			}
+			return launchShell(cfg)
+		},
+	}
+
+	root.PersistentFlags().StringVar(&cfgPath, "config", "", "Path to config.json (default: auto-detected)")
+	root.PersistentFlags().IntVarP(&autonomyFlag, "autonomy", "a", config.AutonomyApproved,
+		"Autonomy level 0–4 (overrides config for this session)")
+	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		autonomyChanged = cmd.Flags().Changed("autonomy")
+		return nil
 	}
 
 	root.AddCommand(buildSessionCmd())
+	root.AddCommand(buildPlansCmd())
+	root.AddCommand(buildConfigCmd())
 	root.AddCommand(buildVersionCmd())
 
 	return root
 }
 
-// buildVersionCmd returns the 'version' subcommand.
+// ── Infrastructure bootstrap ──────────────────────────────────────────────────
+
+// bootstrap creates all shared infrastructure (dirs, config, registry, bus,
+// manifest, scheduler, audit logger, session manager).  Everything that needs
+// to be shared between the shell, the headless runner, and the web UI lives
+// here so it is only constructed once.
+type infra struct {
+	cfg        *config.Config
+	dataPathFn func(string) string
+	logPathFn  func(string) string
+	eventBus   *bus.Bus
+	registry   *capability.Registry
+	validator  *capability.CommandValidator
+	manifestSt *manifest.Store
+	sessionMgr *session.Manager
+	auditLog   *audit.Logger
+	sched      *scheduler.Scheduler
+	apiKey     string
+	workDir    string
+}
+
+func bootstrap(cfg *config.Config) (*infra, error) {
+	// ── Paths ─────────────────────────────────────────────────────────────────
+	dataDir := resolveDataDir()
+	logDir := resolveLogDir()
+
+	dataPathFn := func(rel string) string { return filepath.Join(dataDir, rel) }
+	logPathFn := func(rel string) string { return filepath.Join(logDir, rel) }
+
+	for _, dir := range []string{
+		dataPathFn("sessions"),
+		dataPathFn("plans"),
+		logDir,
+	} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return nil, fmt.Errorf("bootstrap: create dir %s: %w", dir, err)
+		}
+	}
+
+	// ── API key ───────────────────────────────────────────────────────────────
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+
+	// ── Event bus ─────────────────────────────────────────────────────────────
+	b := bus.New(512)
+
+	// ── Capability registry ───────────────────────────────────────────────────
+	reg := capability.NewRegistry()
+	cwd, _ := os.Getwd()
+	reg.SetWorkspace(cwd)
+
+	allowlistPath := dataPathFn("allowlist.yaml")
+	if _, err := os.Stat(allowlistPath); os.IsNotExist(err) {
+		// Fall back to the repo-bundled allowlist
+		allowlistPath = "config/allowlist.yaml"
+	}
+	if err := reg.LoadAllowlist(allowlistPath); err != nil {
+		// Non-fatal: restricted mode
+		fmt.Fprintf(os.Stderr, "Warning: could not load allowlist (%s): %v\n", allowlistPath, err)
+	}
+
+	// ── Command validator ─────────────────────────────────────────────────────
+	mstore := manifest.NewStore(dataPathFn("manifest.json"))
+	// Seed defaults if the manifest doesn't exist yet
+	if _, err := os.Stat(dataPathFn("manifest.json")); os.IsNotExist(err) {
+		mstore.SeedDefaults()
+		_ = mstore.Save()
+	} else {
+		_ = mstore.Load()
+	}
+	validator := capability.NewCommandValidator(reg).WithManifest(mstore)
+
+	// ── Session manager ───────────────────────────────────────────────────────
+	sessionMgr := session.NewManager(dataPathFn("sessions"))
+
+	// ── Audit logger ──────────────────────────────────────────────────────────
+	auditLog, err := audit.NewLogger(logPathFn("audit.jsonl"))
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap: audit logger: %w", err)
+	}
+
+	// ── Scheduler ─────────────────────────────────────────────────────────────
+	sched := scheduler.New(b)
+	sched.DefaultJobs(
+		// manifest:rescan
+		func() {
+			_ = mstore.Load()
+			b.Publish(bus.Event{
+				Kind:      bus.EventManifestUpdated,
+				Payload:   "periodic rescan",
+				Timestamp: time.Now(),
+			})
+		},
+		// session:cleanup — remove sessions older than 30 days
+		func() { _ = sessionMgr.CleanupOld(30 * 24 * time.Hour) },
+		// audit:rotate — rename audit.jsonl → audit-<date>.jsonl
+		func() { rotateAuditLog(logPathFn("audit.jsonl")) },
+	)
+	sched.Start()
+
+	return &infra{
+		cfg:        cfg,
+		dataPathFn: dataPathFn,
+		logPathFn:  logPathFn,
+		eventBus:   b,
+		registry:   reg,
+		validator:  validator,
+		manifestSt: mstore,
+		sessionMgr: sessionMgr,
+		auditLog:   auditLog,
+		sched:      sched,
+		apiKey:     apiKey,
+		workDir:    cwd,
+	}, nil
+}
+
+// ── Shell launch ──────────────────────────────────────────────────────────────
+
+func launchShell(cfg *config.Config) error {
+	infra, err := bootstrap(cfg)
+	if err != nil {
+		return err
+	}
+	defer infra.sched.Stop()
+	defer infra.eventBus.Close()
+
+	// Start inotify watcher on watched paths (best-effort, non-fatal)
+	watcher, watchErr := manifest.NewWatcher(infra.manifestSt, infra.eventBus, cfg.WatchPaths)
+	if watchErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: inotify watcher could not initialise: %v\n", watchErr)
+	} else {
+		watcher.Start()
+		defer watcher.Stop()
+	}
+
+	s := shell.NewShell(shell.Config{
+		APIKey:        infra.apiKey,
+		HypConfig:     infra.cfg,
+		EventBus:      infra.eventBus,
+		Registry:      infra.registry,
+		Validator:     infra.validator,
+		ManifestStore: infra.manifestSt,
+		SessionMgr:    infra.sessionMgr,
+		AuditLogger:   infra.auditLog,
+		DataPathFn:    infra.dataPathFn,
+		LogPathFn:     infra.logPathFn,
+		WorkDir:       infra.workDir,
+	})
+
+	return s.Run()
+}
+
+// ── session command ───────────────────────────────────────────────────────────
+
+func buildSessionCmd() *cobra.Command {
+	sessionCmd := &cobra.Command{
+		Use:   "session",
+		Short: "Manage agent sessions",
+	}
+	sessionCmd.AddCommand(buildSessionStartCmd())
+	sessionCmd.AddCommand(buildSessionListCmd())
+	sessionCmd.AddCommand(buildSessionResumeCmd())
+	return sessionCmd
+}
+
+func buildSessionStartCmd() *cobra.Command {
+	var (
+		noTUI        bool
+		execute      bool
+		autonomyFlag int
+		cfgPath      string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "start [intent]",
+		Short: "Start a new agent session",
+		Long: `Run the full agent pipeline for the given intent.
+
+Without --no-tui, this is equivalent to running 'hyperi' and typing the intent.
+With --no-tui, runs the pipeline headlessly (useful from scripts or systemd).`,
+		Args: cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			intent := strings.Join(args, " ")
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+			if cmd.Flags().Changed("autonomy") {
+				cfg.AutonomyLevel = autonomyFlag
+			}
+
+			if !noTUI {
+				// Launch TUI with the intent pre-filled
+				return launchShellWithIntent(cfg, intent, execute)
+			}
+
+			// Headless mode
+			return runHeadless(cfg, intent, execute)
+		},
+	}
+
+	cmd.Flags().BoolVar(&noTUI, "no-tui", false, "Run headlessly without the TUI")
+	cmd.Flags().BoolVar(&execute, "execute", false, "Execute arbiter-approved steps (headless mode only)")
+	cmd.Flags().IntVar(&autonomyFlag, "autonomy", config.AutonomyApproved, "Autonomy level 0–4")
+	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to config.json")
+	return cmd
+}
+
+func buildSessionListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List recent sessions",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mgr := session.NewManager(filepath.Join(resolveDataDir(), "sessions"))
+			sessions, err := mgr.List()
+			if err != nil {
+				return fmt.Errorf("list sessions: %w", err)
+			}
+			if len(sessions) == 0 {
+				fmt.Println("No sessions found.")
+				return nil
+			}
+			fmt.Printf("%-10s  %-10s  %-20s  %s\n", "ID", "STATUS", "UPDATED", "INTENT")
+			fmt.Println(strings.Repeat("─", 72))
+			for _, s := range sessions {
+				status := s.Status
+				if status == "" {
+					status = "unknown"
+				}
+				fmt.Printf("%-10s  %-10s  %-20s  %s\n",
+					s.ID,
+					status,
+					s.UpdatedAt.Format("2006-01-02 15:04:05"),
+					truncate(s.Intent, 36),
+				)
+			}
+			return nil
+		},
+	}
+}
+
+func buildSessionResumeCmd() *cobra.Command {
+	var cfgPath string
+
+	cmd := &cobra.Command{
+		Use:   "resume <session-id>",
+		Short: "Resume a halted or in-progress session",
+		Long: `Re-opens the TUI and resumes a halted session.
+For approval-halted sessions, re-presents the pending approval prompt.
+For execution-halted sessions, re-enters the re-plan loop.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sessionID := args[0]
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			planPath := filepath.Join(dataDir, "plans", sessionID+".md")
+			if _, err := os.Stat(planPath); os.IsNotExist(err) {
+				return fmt.Errorf("no plan doc found for session %s (expected %s)", sessionID, planPath)
+			}
+
+			planState, err := plan.ParsePlanDoc(planPath)
+			if err != nil {
+				return fmt.Errorf("parse plan doc: %w", err)
+			}
+
+			switch planState.Status {
+			case plan.StatusCompleted:
+				fmt.Printf("Session %s is already completed.\n", sessionID)
+				return nil
+			case plan.StatusInProgress, plan.StatusHalted, plan.StatusFailed:
+				fmt.Printf("Resuming session %s (status: %s)...\n", sessionID, planState.Status)
+			default:
+				fmt.Printf("Session %s has unknown status %q — attempting resume anyway.\n", sessionID, planState.Status)
+			}
+
+			// Launch TUI with resume intent
+			resumeIntent := fmt.Sprintf("__resume__:%s", sessionID)
+			return launchShellWithIntent(cfg, resumeIntent, true)
+		},
+	}
+
+	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to config.json")
+	return cmd
+}
+
+// ── plans command ─────────────────────────────────────────────────────────────
+
+func buildPlansCmd() *cobra.Command {
+	var statusFilter string
+
+	cmd := &cobra.Command{
+		Use:   "plans",
+		Short: "List plan documents by status",
+		Long: `List all plan documents, optionally filtered by status.
+
+Status values: in-progress, completed, failed, halted
+
+Plan documents are stored at <data-dir>/plans/<session-id>.md`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			plansDir := filepath.Join(resolveDataDir(), "plans")
+			entries, err := os.ReadDir(plansDir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					fmt.Println("No plans found.")
+					return nil
+				}
+				return fmt.Errorf("read plans dir: %w", err)
+			}
+
+			type planSummary struct {
+				path      string
+				name      string
+				status    string
+				sessionID string
+				modTime   time.Time
+			}
+
+			var plans []planSummary
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+					continue
+				}
+				path := filepath.Join(plansDir, entry.Name())
+				state, err := plan.ParsePlanDoc(path)
+				if err != nil {
+					continue
+				}
+				if statusFilter != "" && state.Status != statusFilter {
+					continue
+				}
+				info, _ := entry.Info()
+				mod := time.Time{}
+				if info != nil {
+					mod = info.ModTime()
+				}
+				plans = append(plans, planSummary{
+					path:      path,
+					name:      strings.TrimSuffix(entry.Name(), ".md"),
+					status:    state.Status,
+					sessionID: state.SessionID,
+					modTime:   mod,
+				})
+			}
+
+			if len(plans) == 0 {
+				if statusFilter != "" {
+					fmt.Printf("No plans with status %q found.\n", statusFilter)
+				} else {
+					fmt.Println("No plans found.")
+				}
+				return nil
+			}
+
+			// Sort by mod time descending
+			sort.Slice(plans, func(i, j int) bool {
+				return plans[i].modTime.After(plans[j].modTime)
+			})
+
+			fmt.Printf("%-10s  %-12s  %-20s  %s\n", "SESSION", "STATUS", "UPDATED", "FILE")
+			fmt.Println(strings.Repeat("─", 68))
+			for _, p := range plans {
+				fmt.Printf("%-10s  %-12s  %-20s  %s\n",
+					p.sessionID,
+					p.status,
+					p.modTime.Format("2006-01-02 15:04:05"),
+					filepath.Base(p.path),
+				)
+			}
+			fmt.Printf("\nPlan documents: %s\n", plansDir)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&statusFilter, "status", "s", "", "Filter by status (in-progress|completed|failed|halted)")
+	return cmd
+}
+
+// ── config command ────────────────────────────────────────────────────────────
+
+func buildConfigCmd() *cobra.Command {
+	configCmd := &cobra.Command{
+		Use:   "config",
+		Short: "View and modify HyperiOS configuration",
+	}
+	configCmd.AddCommand(buildConfigGetCmd())
+	configCmd.AddCommand(buildConfigSetCmd())
+	configCmd.AddCommand(buildConfigShowCmd())
+	return configCmd
+}
+
+func buildConfigGetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "get <key>",
+		Short: "Get a config value",
+		Long: `Get a configuration value by key.
+
+Keys: autonomy_level, approval_timeout_foreground, approval_timeout_background,
+      voice_enabled, voice_push_to_talk_key, whisper_model_path`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig("")
+			if err != nil {
+				return err
+			}
+			key := args[0]
+			switch key {
+			case "autonomy_level":
+				fmt.Printf("%d  (%s)\n", cfg.AutonomyLevel, config.AutonomyLevelText(cfg.AutonomyLevel))
+			case "approval_timeout_foreground":
+				fmt.Printf("%ds\n", cfg.ApprovalTimeoutForeground)
+			case "approval_timeout_background":
+				fmt.Printf("%ds\n", cfg.ApprovalTimeoutBackground)
+			case "voice_enabled":
+				fmt.Printf("%v\n", cfg.VoiceEnabled)
+			case "voice_push_to_talk_key":
+				fmt.Printf("%s\n", cfg.VoicePushToTalkKey)
+			case "whisper_model_path":
+				fmt.Printf("%s\n", cfg.WhisperModelPath)
+			default:
+				return fmt.Errorf("unknown config key %q\nValid keys: autonomy_level, approval_timeout_foreground, approval_timeout_background, voice_enabled, voice_push_to_talk_key, whisper_model_path", key)
+			}
+			return nil
+		},
+	}
+}
+
+func buildConfigSetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "set <key> <value>",
+		Short: "Set a config value",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfgPath := defaultConfigPath()
+			cfg, err := loadConfig("")
+			if err != nil {
+				return err
+			}
+			key, val := args[0], args[1]
+			switch key {
+			case "autonomy_level":
+				n, err := strconv.Atoi(val)
+				if err != nil || n < 0 || n > 4 {
+					return fmt.Errorf("autonomy_level must be 0–4, got %q", val)
+				}
+				cfg.AutonomyLevel = n
+				cfg.AutonomyUpdatedAt = time.Now()
+				cfg.AutonomyUpdatedBy = currentUser()
+				fmt.Printf("autonomy_level set to %d (%s)\n", n, config.AutonomyLevelText(n))
+			case "approval_timeout_foreground":
+				n, err := strconv.Atoi(val)
+				if err != nil || n <= 0 {
+					return fmt.Errorf("approval_timeout_foreground must be a positive integer (seconds)")
+				}
+				cfg.ApprovalTimeoutForeground = n
+				fmt.Printf("approval_timeout_foreground set to %ds\n", n)
+			case "approval_timeout_background":
+				n, err := strconv.Atoi(val)
+				if err != nil || n <= 0 {
+					return fmt.Errorf("approval_timeout_background must be a positive integer (seconds)")
+				}
+				cfg.ApprovalTimeoutBackground = n
+				fmt.Printf("approval_timeout_background set to %ds\n", n)
+			case "voice_enabled":
+				switch val {
+				case "true", "1", "yes":
+					cfg.VoiceEnabled = true
+				case "false", "0", "no":
+					cfg.VoiceEnabled = false
+				default:
+					return fmt.Errorf("voice_enabled must be true or false")
+				}
+				fmt.Printf("voice_enabled set to %v\n", cfg.VoiceEnabled)
+			case "voice_push_to_talk_key":
+				cfg.VoicePushToTalkKey = val
+				fmt.Printf("voice_push_to_talk_key set to %q\n", val)
+			case "whisper_model_path":
+				cfg.WhisperModelPath = val
+				fmt.Printf("whisper_model_path set to %q\n", val)
+			default:
+				return fmt.Errorf("unknown config key %q", key)
+			}
+			if err := config.Save(cfgPath, cfg); err != nil {
+				return fmt.Errorf("save config: %w", err)
+			}
+			return nil
+		},
+	}
+}
+
+func buildConfigShowCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "show",
+		Short: "Show current configuration",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig("")
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Config: %s\n\n", defaultConfigPath())
+			fmt.Printf("  autonomy_level              %d  (%s)\n",
+				cfg.AutonomyLevel, config.AutonomyLevelText(cfg.AutonomyLevel))
+			fmt.Printf("  approval_timeout_foreground %ds\n", cfg.ApprovalTimeoutForeground)
+			fmt.Printf("  approval_timeout_background %ds\n", cfg.ApprovalTimeoutBackground)
+			fmt.Printf("  voice_enabled               %v\n", cfg.VoiceEnabled)
+			fmt.Printf("  voice_push_to_talk_key      %s\n", cfg.VoicePushToTalkKey)
+			fmt.Printf("  whisper_model_path          %s\n", cfg.WhisperModelPath)
+			fmt.Printf("  whisper_cli_path            %s\n", cfg.WhisperCLIPath)
+			if !cfg.AutonomyUpdatedAt.IsZero() {
+				fmt.Printf("\n  autonomy last changed by %s at %s\n",
+					cfg.AutonomyUpdatedBy,
+					cfg.AutonomyUpdatedAt.Format(time.RFC3339),
+				)
+			}
+			return nil
+		},
+	}
+}
+
+// ── version command ───────────────────────────────────────────────────────────
+
 func buildVersionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
@@ -66,278 +621,70 @@ func buildVersionCmd() *cobra.Command {
 	}
 }
 
-// buildSessionCmd returns the 'session' subcommand tree.
-func buildSessionCmd() *cobra.Command {
-	sessionCmd := &cobra.Command{
-		Use:   "session",
-		Short: "Manage hyperi agent sessions",
-	}
+// ── Headless pipeline runner ──────────────────────────────────────────────────
 
-	sessionCmd.AddCommand(buildSessionStartCmd())
-	sessionCmd.AddCommand(buildSessionListCmd())
-
-	return sessionCmd
-}
-
-// buildSessionStartCmd returns 'session start [intent]'.
-func buildSessionStartCmd() *cobra.Command {
-	var (
-		execute      bool
-		dryRun       bool
-		autonomyFlag int
-		configPath   string
-	)
-
-	cmd := &cobra.Command{
-		Use:   "start [intent]",
-		Short: "Start a new agent session",
-		Long: `Run the full agent pipeline for the given intent.
-Without --execute, the plan is printed but not executed (same as --dry-run).
-With --execute, arbiter-approved steps run automatically at the configured autonomy level.`,
-		Args: cobra.MaximumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			intent := ""
-			if len(args) > 0 {
-				intent = strings.Join(args, " ")
-			}
-
-			// Resolve config path
-			if configPath == "" {
-				configPath = defaultConfigPath()
-			}
-
-			cfg, err := config.Load(configPath)
-			if err != nil {
-				return fmt.Errorf("load config: %w", err)
-			}
-
-			// --autonomy overrides persisted level
-			if cmd.Flags().Changed("autonomy") {
-				cfg.AutonomyLevel = autonomyFlag
-			}
-
-			// --dry-run forces non-execute mode
-			if dryRun {
-				execute = false
-			}
-
-			return runSession(cmd.Context(), intent, cfg, execute)
-		},
-	}
-
-	cmd.Flags().BoolVar(&execute, "execute", false, "Execute arbiter-approved steps (default: dry-run)")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print the plan without executing (overrides --execute)")
-	cmd.Flags().IntVar(&autonomyFlag, "autonomy", config.AutonomyApproved, "Autonomy level 0–4")
-	cmd.Flags().StringVar(&configPath, "config", "", "Path to config.json (default: ~/.hyperi/config.json)")
-
-	return cmd
-}
-
-// buildSessionListCmd returns 'session list'.
-func buildSessionListCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "list",
-		Short: "List recent sessions",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr := session.NewManager("")
-			sessions, err := mgr.List()
-			if err != nil {
-				return fmt.Errorf("list sessions: %w", err)
-			}
-			if len(sessions) == 0 {
-				fmt.Println("No sessions found.")
-				return nil
-			}
-			fmt.Printf("%-36s  %-10s  %s\n", "ID", "STATUS", "INTENT")
-			for _, s := range sessions {
-				status := s.Status
-				if status == "" {
-					status = "unknown"
-				}
-				fmt.Printf("%-36s  %-10s  %s\n", s.ID, status, truncate(s.Intent, 60))
-			}
-			return nil
-		},
-	}
-}
-
-// runSession executes the full Intent→Plan→Adversarial→Arbiter→Execute pipeline.
-func runSession(ctx context.Context, intent string, cfg *config.Config, execute bool) error {
-	// ── Gather workspace context ─────────────────────────────────────────────
-	wsCtx := gatherWorkspaceContext()
-
-	// ── Session setup ────────────────────────────────────────────────────────
-	sessionID := uuid.New().String()
-	state := session.NewState(sessionID, intent, wsCtx)
-	state.AutonomyLevel = cfg.AutonomyLevel
-
-	mgr := session.NewManager("")
-
-	fmt.Printf("[hyperi] session %s started\n", sessionID)
-	fmt.Printf("[hyperi] intent: %s\n", intent)
-	fmt.Printf("[hyperi] autonomy: %s\n", config.AutonomyLevelText(cfg.AutonomyLevel))
-
-	// ── LLM client ──────────────────────────────────────────────────────────
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	llmClient := llm.NewClient(apiKey)
-
-	// ── Intent Agent ─────────────────────────────────────────────────────────
-	fmt.Println("[hyperi] running intent agent...")
-	ia := agents.NewIntentAgent(llmClient)
-	graph, err := ia.Run(ctx, intent, wsCtx)
+// runHeadless runs the full pipeline without the TUI. Used by
+// `hyperi session start --no-tui` and the systemd service (Phase 0/1).
+func runHeadless(cfg *config.Config, intent string, execute bool) error {
+	infra, err := bootstrap(cfg)
 	if err != nil {
-		return fmt.Errorf("intent agent: %w", err)
+		return err
 	}
-	state.Goals = graph.Goals
-	_ = mgr.Save(state)
+	defer infra.sched.Stop()
+	defer infra.eventBus.Close()
 
-	// ── Planner Agent ────────────────────────────────────────────────────────
-	fmt.Println("[hyperi] running planner agent...")
-	pa := agents.NewPlannerAgent(llmClient)
-	plan, err := pa.Run(ctx, graph)
-	if err != nil {
-		return fmt.Errorf("planner agent: %w", err)
-	}
-	state.Plan = plan
-	_ = mgr.Save(state)
+	// Subscribe audit consumer
+	auditCh := infra.eventBus.Subscribe()
+	go bus.DrainToAudit(auditCh, infra.auditLog.Log)
 
-	// ── Adversarial Agent ────────────────────────────────────────────────────
-	fmt.Println("[hyperi] running adversarial agent...")
-	aa := agents.NewAdversarialAgent(llmClient)
-	report, err := aa.Run(ctx, graph, plan)
-	if err != nil {
-		return fmt.Errorf("adversarial agent: %w", err)
+	if intent == "" {
+		return fmt.Errorf("intent is required in --no-tui mode")
 	}
 
-	// ── Policy Arbiter ───────────────────────────────────────────────────────
-	fmt.Println("[hyperi] running policy arbiter...")
-	arb := arbiter.NewWithLevel(cfg.AutonomyLevel)
-	verdicts := arb.Decide(plan, report)
-
-	// ── Present plan ─────────────────────────────────────────────────────────
-	stub := executor.NewStub(os.Stdout)
-	stub.Present(plan, verdicts, report)
-
-	if !execute {
-		fmt.Println("\n[hyperi] dry-run mode — use --execute to run approved steps")
-		state.Status = "halted"
-		_ = mgr.Save(state)
-		return nil
-	}
-
-	// ── Execute approved steps ───────────────────────────────────────────────
-	cwd := wsCtx.Cwd
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
-
-	reg := capability.NewRegistry()
-	reg.SetWorkspace(cwd)
-
-	allowlistPath := filepath.Join(defaultConfigDir(), "allowlist.yaml")
-	if _, statErr := os.Stat(allowlistPath); statErr == nil {
-		if loadErr := reg.LoadAllowlist(allowlistPath); loadErr != nil {
-			fmt.Fprintf(os.Stderr, "[hyperi] warning: could not load allowlist: %v\n", loadErr)
-		}
-	}
-
-	b := bus.New(256)
-	defer b.Close()
-
-	exec_ := executor.New(executor.ExecutorConfig{
-		DryRun:       false,
-		Registry:     reg,
-		Workspace:    cwd,
-		ExecutorType: plan.Executor,
-		Bus:          b,
-		SessionID:    sessionID,
+	runner := shell.NewPipelineRunner(shell.RunnerConfig{
+		APIKey:        infra.apiKey,
+		AutonomyLevel: cfg.AutonomyLevel,
+		ExecutorType:  "local",
+		EventBus:      infra.eventBus,
+		Registry:      infra.registry,
+		Validator:     infra.validator,
+		Manifest:      infra.manifestSt,
+		SessionMgr:    infra.sessionMgr,
+		AuditLogger:   infra.auditLog,
+		Config:        infra.cfg,
+		DataPathFn:    infra.dataPathFn,
+		WorkspaceDir:  infra.workDir,
 	})
 
-	verdictMap := map[string]types.ArbiterVerdict{}
-	for _, v := range verdicts {
-		verdictMap[v.StepID] = v
+	if !execute {
+		// Autonomy 0 = observe only — present plan, don't execute
+		cfg.AutonomyLevel = config.AutonomyObserve
 	}
 
-	fmt.Println("\n[hyperi] executing approved steps...")
-	state.Status = "in-progress"
-	_ = mgr.Save(state)
-
-	for _, step := range plan.Steps {
-		v, ok := verdictMap[step.ID]
-		if !ok || v.Verdict == "blocked" {
-			fmt.Printf("[hyperi] skipping blocked step %s: %s\n", step.ID, step.Description)
-			continue
-		}
-
-		fmt.Printf("[hyperi] executing step %s: %s\n", step.ID, step.Description)
-		result, execErr := exec_.Execute(ctx, step)
-		if execErr != nil {
-			if errors.Is(execErr, executor.ErrStepSkipped) {
-				fmt.Printf("[hyperi] step %s skipped\n", step.ID)
-				state.MarkCompleted(step.ID)
-				_ = mgr.Save(state)
-				continue
-			}
-			if errors.Is(execErr, executor.ErrReplan) {
-				fmt.Printf("[hyperi] step %s triggered replan — halting session\n", step.ID)
-				state.Status = "halted"
-				_ = mgr.Save(state)
-				return fmt.Errorf("replan requested at step %s", step.ID)
-			}
-			// on_failure=halt or other error
-			state.Status = "failed"
-			_ = mgr.Save(state)
-			return fmt.Errorf("step %s failed: %w", step.ID, execErr)
-		}
-
-		if result != nil && !result.Success {
-			fmt.Fprintf(os.Stderr, "[hyperi] step %s returned failure: %s\n", step.ID, result.Error)
-			state.Status = "failed"
-			_ = mgr.Save(state)
-			return fmt.Errorf("step %s failed: %s", step.ID, result.Error)
-		}
-
-		state.MarkCompleted(step.ID)
-		_ = mgr.Save(state)
-		fmt.Printf("[hyperi] step %s complete\n", step.ID)
-	}
-
-	completed, total := state.Progress()
-	state.Status = "completed"
-	_ = mgr.Save(state)
-
-	fmt.Printf("\n[hyperi] session complete: %d/%d steps executed\n", completed, total)
-	return nil
+	return runner(intent, "")
 }
 
-// gatherWorkspaceContext collects git and filesystem context for the current directory.
-func gatherWorkspaceContext() types.WorkspaceContext {
-	cwd, _ := os.Getwd()
-
-	branch := runGit("rev-parse", "--abbrev-ref", "HEAD")
-	log := runGit("log", "--oneline", "-5")
-	status := runGit("status", "--short")
-
-	return types.WorkspaceContext{
-		Cwd:       cwd,
-		GitBranch: strings.TrimSpace(branch),
-		GitLog:    strings.TrimSpace(log),
-		GitStatus: strings.TrimSpace(status),
+// launchShellWithIntent opens the TUI shell with an intent pre-queued.
+// The intent is submitted automatically as the first command after the TUI
+// is ready. When intent is empty it just opens the shell normally.
+func launchShellWithIntent(cfg *config.Config, intent string, _ bool) error {
+	// For now, set the intent as an env var that the shell model picks up on
+	// startup via the standard notification/startup path. Full pre-queue wiring
+	// (passing the intent directly to shell.Model) is left as Phase 2 polish.
+	if intent != "" && !strings.HasPrefix(intent, "__resume__:") {
+		os.Setenv("HYPERI_INITIAL_INTENT", intent)
 	}
+	return launchShell(cfg)
 }
 
-// runGit runs a git sub-command and returns stdout. Returns empty string on error.
-func runGit(args ...string) string {
-	out, err := exec.Command("git", args...).Output()
-	if err != nil {
-		return ""
-	}
-	return string(out)
-}
+// ── Path helpers ──────────────────────────────────────────────────────────────
 
-// defaultConfigDir returns the directory where hyperi stores its config.
-func defaultConfigDir() string {
-	// Service user: /var/lib/hyperi; dev user: ~/.hyperi
+// resolveDataDir returns the agent data directory.
+// Priority: HYPERI_DATA_DIR env → /var/lib/hyperi (if exists) → ~/.hyperi
+func resolveDataDir() string {
+	if d := os.Getenv("HYPERI_DATA_DIR"); d != "" {
+		return d
+	}
 	if _, err := os.Stat("/var/lib/hyperi"); err == nil {
 		return "/var/lib/hyperi"
 	}
@@ -345,9 +692,50 @@ func defaultConfigDir() string {
 	return filepath.Join(home, ".hyperi")
 }
 
+// resolveLogDir returns the agent log directory.
+func resolveLogDir() string {
+	if d := os.Getenv("HYPERI_LOG_DIR"); d != "" {
+		return d
+	}
+	if _, err := os.Stat("/var/log/hyperi"); err == nil {
+		return "/var/log/hyperi"
+	}
+	return filepath.Join(resolveDataDir(), "logs")
+}
+
 // defaultConfigPath returns the path to config.json.
 func defaultConfigPath() string {
-	return filepath.Join(defaultConfigDir(), "config.json")
+	return filepath.Join(resolveDataDir(), "config.json")
+}
+
+// loadConfig loads the runtime config from the given path, or auto-detects it.
+func loadConfig(path string) (*config.Config, error) {
+	if path == "" {
+		path = defaultConfigPath()
+	}
+	return config.Load(path)
+}
+
+// ── Misc utilities ────────────────────────────────────────────────────────────
+
+// rotateAuditLog renames audit.jsonl → audit-<date>.jsonl.
+func rotateAuditLog(path string) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return
+	}
+	dest := strings.TrimSuffix(path, ".jsonl") + "-" + time.Now().Format("2006-01-02") + ".jsonl"
+	_ = os.Rename(path, dest)
+}
+
+// currentUser returns the current OS username, or "unknown".
+func currentUser() string {
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	if u := os.Getenv("LOGNAME"); u != "" {
+		return u
+	}
+	return "unknown"
 }
 
 // truncate shortens s to max runes, appending "…" if truncated.
