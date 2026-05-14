@@ -1,5 +1,5 @@
-# Binaries
-hyperi
+# Binaries (root-level compiled output only — not the cmd/ source directory)
+/hyperi
 hyperi-*
 
 # Build artifacts
