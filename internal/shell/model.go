@@ -599,9 +599,19 @@ func (m *Model) handleBusEvent(e bus.Event) {
 			style: styleStepSkip,
 		})
 
+	case bus.EventKind("plan:response"):
+		if text, ok := e.Payload.(string); ok && text != "" {
+			m.appendBlank()
+			m.appendLine(outputLine{text: "── Answer ───────────────────────────────", style: stylePlanHeading})
+			for _, line := range strings.Split(text, "\n") {
+				m.appendLine(outputLine{text: line, style: styleOutput})
+			}
+			m.appendBlank()
+		}
+
 	case bus.EventPlanCompleted:
 		m.appendLine(outputLine{
-			text:  "✓ Plan completed",
+			text:  "✓ Done",
 			style: styleStepOk,
 		})
 
@@ -721,11 +731,17 @@ func (m *Model) appendBlank() {
 func (m *Model) appendHelp() {
 	m.appendBlank()
 	m.appendLine(outputLine{text: "HyperiOS Shell — built-in commands:", style: stylePlanHeading})
-	m.appendLine(outputLine{text: "  clear           clear the output area", style: styleOutput})
-	m.appendLine(outputLine{text: "  help            show this help", style: styleOutput})
-	m.appendLine(outputLine{text: "  exit / quit     exit the shell", style: styleOutput})
-	m.appendLine(outputLine{text: "  ↑ / ↓           navigate command history", style: styleOutput})
-	m.appendLine(outputLine{text: "  Ctrl+C          exit", style: styleOutput})
+	m.appendLine(outputLine{text: "  clear              clear the output area", style: styleOutput})
+	m.appendLine(outputLine{text: "  help               show this help", style: styleOutput})
+	m.appendLine(outputLine{text: "  exit / quit        exit the shell", style: styleOutput})
+	m.appendBlank()
+	m.appendLine(outputLine{text: "Navigation:", style: stylePlanHeading})
+	m.appendLine(outputLine{text: "  ↑ / ↓             navigate command history (at prompt)", style: styleOutput})
+	m.appendLine(outputLine{text: "  PgUp / PgDn       scroll output", style: styleOutput})
+	m.appendLine(outputLine{text: "  Home / End        jump to top / bottom of output", style: styleOutput})
+	m.appendLine(outputLine{text: "  Ctrl+C            exit", style: styleOutput})
+	m.appendBlank()
+	m.appendLine(outputLine{text: "Text selection: use your terminal's normal mouse selection to copy.", style: styleGray})
 	m.appendBlank()
 	m.appendLine(outputLine{text: "Anything else is sent to the agent pipeline as an intent.", style: styleSystem})
 	m.appendBlank()

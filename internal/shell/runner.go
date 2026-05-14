@@ -203,6 +203,9 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 
 	replanStepID := ""
 
+	// stepResults collects outcomes for the response synthesis stage.
+	var stepResults []stepResult
+
 	for _, step := range agentPlan.Steps {
 		v := findVerdict(verdicts, step.ID)
 		if v == nil {
@@ -253,6 +256,9 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 
 		if vr := a.validator.Validate(step); !vr.Valid {
 			_ = a.planWriter.WriteStepSkipped(step, vr.Reason)
+			// Publish so the TUI shows why the step was skipped
+			pub(bus.EventStepSkipped, vr.Reason)
+			stepResults = append(stepResults, stepResult{step: step, skipped: true, reason: vr.Reason})
 			continue
 		}
 
@@ -262,6 +268,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		_ = a.logger.Log(a.sessionID, "execution", step, result)
 
 		if execErr == executor.ErrStepSkipped {
+			stepResults = append(stepResults, stepResult{step: step, skipped: true, reason: result.Error})
 			continue
 		}
 		if execErr == executor.ErrReplan {
@@ -277,12 +284,15 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		}
 
 		if result.Success {
+			stepResults = append(stepResults, stepResult{step: step, result: result})
 			a.state.MarkCompleted(step.ID)
 			_ = a.sessionMgr.Save(a.state)
 			if a.manifestStore != nil {
 				a.manifestStore.PostExecutionHook(step.Command)
 				_ = a.manifestStore.Save()
 			}
+		} else {
+			stepResults = append(stepResults, stepResult{step: step, result: result, failed: true})
 		}
 	}
 
@@ -317,11 +327,111 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		return runPipeline(ctx, a)
 	}
 
+	// ── Response synthesis ────────────────────────────────────────────────────
+	// Ask the LLM to summarise all step outputs into a plain-English answer
+	// for the user, then publish it as a plan:response event for the TUI.
+	responseText := synthesiseResponse(ctx, a.client, a.intent, stepResults)
+	pub(bus.EventKind("plan:response"), responseText)
+	_ = a.planWriter.WriteStageComplete("response", responseText, "hyperi-response")
+
 	_ = a.planWriter.Finalize(plan.StatusCompleted)
 	a.state.Status = "completed"
 	_ = a.sessionMgr.Save(a.state)
 	pub(bus.EventPlanCompleted, "all steps completed")
 	return nil
+}
+
+// stepResult holds the outcome of a single executed step.
+type stepResult struct {
+	step    types.ActionStep
+	result  *types.ExecutionResult
+	skipped bool
+	failed  bool
+	reason  string // populated when skipped=true
+}
+
+// synthesiseResponse asks the LLM to turn raw step outputs into a concise,
+// user-facing answer. Falls back to a plain-text summary if the LLM call fails.
+func synthesiseResponse(ctx context.Context, client llm.Completer, intent string, results []stepResult) string {
+	if len(results) == 0 {
+		return "All steps were blocked or skipped — nothing was executed."
+	}
+
+	// Build a compact summary of outputs for the LLM
+	var sb strings.Builder
+	sb.WriteString("Original intent: ")
+	sb.WriteString(intent)
+	sb.WriteString("\n\nStep outputs:\n")
+
+	anyOutput := false
+	for _, r := range results {
+		sb.WriteString(fmt.Sprintf("\nStep [%s]: %s\n", r.step.ID, r.step.Description))
+		switch {
+		case r.skipped:
+			sb.WriteString("  Status: skipped — ")
+			sb.WriteString(r.reason)
+		case r.failed:
+			sb.WriteString("  Status: failed — ")
+			if r.result != nil {
+				sb.WriteString(r.result.Error)
+			}
+		case r.result != nil && r.result.Output != "":
+			sb.WriteString("  Output:\n")
+			// Truncate very long outputs to keep the LLM prompt manageable
+			out := r.result.Output
+			if len(out) > 4000 {
+				out = out[:4000] + "\n... (truncated)"
+			}
+			sb.WriteString(out)
+			anyOutput = true
+		default:
+			sb.WriteString("  Status: completed (no output)")
+		}
+		sb.WriteString("\n")
+	}
+
+	// If there's literally nothing to summarise, skip the LLM call
+	if !anyOutput {
+		return buildFallbackResponse(results)
+	}
+
+	system := `You are the response formatter for HyperiOS, an AI-driven OS agent.
+The agent has just executed a series of steps to fulfil a user's intent.
+Your job is to write a concise, direct answer to the user based on the step outputs.
+
+Rules:
+- Answer the original intent directly and completely.
+- Present data (numbers, tables, lists) clearly — use plain text formatting, not markdown headers.
+- Do not narrate what the agent did ("I ran df -h..."). Just give the answer.
+- If a step failed or was skipped, mention it briefly only if it affects the answer.
+- Keep it short: 1–10 lines for simple questions, longer only if the data requires it.`
+
+	response, err := client.CompleteWithRetry(ctx, system, sb.String())
+	if err != nil {
+		return buildFallbackResponse(results)
+	}
+	return strings.TrimSpace(response)
+}
+
+// buildFallbackResponse produces a minimal plain-text summary without an LLM call.
+func buildFallbackResponse(results []stepResult) string {
+	var sb strings.Builder
+	for _, r := range results {
+		switch {
+		case r.skipped:
+			sb.WriteString(fmt.Sprintf("[%s] skipped: %s\n", r.step.ID, r.reason))
+		case r.failed && r.result != nil:
+			sb.WriteString(fmt.Sprintf("[%s] failed: %s\n", r.step.ID, r.result.Error))
+		case r.result != nil && r.result.Output != "":
+			sb.WriteString(r.result.Output)
+			if !strings.HasSuffix(r.result.Output, "\n") {
+				sb.WriteString("\n")
+			}
+		default:
+			sb.WriteString(fmt.Sprintf("[%s] completed\n", r.step.ID))
+		}
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 func findVerdict(verdicts []types.ArbiterVerdict, stepID string) *types.ArbiterVerdict {

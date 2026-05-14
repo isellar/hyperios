@@ -119,11 +119,14 @@ func (s *Shell) Run() error {
 	}
 	model := New(s.eventBus, runner, notifications, s.workDir, vc)
 
-	// Run bubbletea
+	// Run bubbletea.
+	// WithMouseCellMotion is intentionally omitted: enabling bubbletea mouse
+	// mode intercepts terminal mouse events, which prevents the user from
+	// selecting and copying text with the mouse. Viewport scrolling still works
+	// via keyboard (↑/↓, PgUp/PgDn, Home/End).
 	p := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
 	)
 
 	if _, err := p.Run(); err != nil {
