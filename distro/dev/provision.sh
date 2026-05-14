@@ -1,11 +1,27 @@
 #!/usr/bin/env bash
-# HyperiOS dev VM provisioner
-# Idempotent — safe to run multiple times via 'vagrant provision'
+# HyperiOS dev provisioner
+# Idempotent — safe to run multiple times.
+# Works in two modes:
+#   Vagrant:      /vagrant is the synced repo root (set by Vagrant automatically)
+#   Real machine: REPO env var or auto-detected from script location
+#
 # Mirrors what cloud-init/user-data.yaml does on a real install.
 
 set -euo pipefail
 
-echo "==> HyperiOS dev provisioner starting"
+# ── Detect repo root ───────────────────────────────────────────────────────────
+# Priority: 1) explicit REPO env var, 2) /vagrant (Vagrant), 3) script location
+if [ -z "${REPO:-}" ]; then
+    if [ -d /vagrant ] && [ -f /vagrant/go.mod ]; then
+        REPO=/vagrant
+    else
+        # Resolve from script location: distro/dev/provision.sh -> repo root
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    fi
+fi
+export REPO
+echo "==> HyperiOS dev provisioner starting (repo: $REPO)"
 
 # ── System update ──────────────────────────────────────────────────────────────
 echo "==> Updating packages..."
@@ -72,27 +88,36 @@ chmod 750 /var/lib/hyperi /var/log/hyperi
 
 # ── sudoers ────────────────────────────────────────────────────────────────────
 echo "==> Installing sudoers config..."
-cp /vagrant/distro/sudoers/hyperi /etc/sudoers.d/hyperi
-chmod 440 /etc/sudoers.d/hyperi
-# Validate
-visudo -c -f /etc/sudoers.d/hyperi
+if [ -f "$REPO/distro/sudoers/hyperi" ]; then
+    cp "$REPO/distro/sudoers/hyperi" /etc/sudoers.d/hyperi
+    chmod 440 /etc/sudoers.d/hyperi
+    # Validate before activating
+    visudo -c -f /etc/sudoers.d/hyperi
+    echo "    sudoers config installed"
+else
+    echo "    WARNING: $REPO/distro/sudoers/hyperi not found — skipping sudoers install"
+fi
 
 # ── sway config ────────────────────────────────────────────────────────────────
 echo "==> Installing sway config..."
 mkdir -p /etc/sway
-cp /vagrant/distro/sway/config /etc/sway/config
+cp "$REPO/distro/sway/config" /etc/sway/config
 
 # ── systemd service ────────────────────────────────────────────────────────────
 echo "==> Installing hyperi.service..."
-cp /vagrant/distro/systemd/hyperi.service /etc/systemd/system/hyperi.service
+cp "$REPO/distro/systemd/hyperi.service" /etc/systemd/system/hyperi.service
 systemctl daemon-reload
 
 # Enable but don't start — binary may not be present yet
 systemctl enable hyperi || true
 
-# ydotoold
-systemctl enable ydotoold || true
-systemctl start ydotoold || true
+# ydotoold — only present on systems with the ydotool daemon unit
+if systemctl cat ydotoold &>/dev/null; then
+    systemctl enable ydotoold || true
+    systemctl start ydotoold || true
+else
+    echo "    ydotoold.service not found on this system — skipping"
+fi
 
 # ── Environment file ───────────────────────────────────────────────────────────
 if [ ! -f /etc/hyperi/environment ]; then
@@ -111,13 +136,13 @@ fi
 
 # ── hyperi binary ──────────────────────────────────────────────────────────────
 echo "==> Installing hyperi binary (if built)..."
-if [ -f /vagrant/dist/hyperi-linux-amd64 ]; then
-    cp /vagrant/dist/hyperi-linux-amd64 /usr/local/bin/hyperi
+if [ -f "$REPO/dist/hyperi-linux-amd64" ]; then
+    cp "$REPO/dist/hyperi-linux-amd64" /usr/local/bin/hyperi
     chmod +x /usr/local/bin/hyperi
     echo "    hyperi binary installed: $(hyperi --version 2>/dev/null || echo 'version unknown')"
 else
-    echo "    No binary found at /vagrant/dist/hyperi-linux-amd64"
-    echo "    Run 'just build' on host then 'vagrant provision' to install"
+    echo "    No binary found at $REPO/dist/hyperi-linux-amd64"
+    echo "    Run 'go build -buildvcs=false -o dist/hyperi-linux-amd64 ./cmd/hyperi' then re-run provision"
 fi
 
 echo ""
@@ -125,6 +150,7 @@ echo "==> HyperiOS dev provisioner complete."
 echo ""
 echo "    Next steps:"
 echo "    1. Set ANTHROPIC_API_KEY in /etc/hyperi/environment"
-echo "    2. Run: just build  (on host), then: vagrant provision"
-echo "    3. Run: sudo systemctl start hyperi"
-echo "    4. Check logs: journalctl -u hyperi -f"
+echo "    2. Build: go build -buildvcs=false -o dist/hyperi-linux-amd64 ./cmd/hyperi"
+echo "    3. Re-run: sudo bash distro/dev/provision.sh"
+echo "    4. Run: sudo systemctl start hyperi"
+echo "    5. Check logs: journalctl -u hyperi -f"

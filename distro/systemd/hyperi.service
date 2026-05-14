@@ -6,6 +6,10 @@ After=network-online.target
 Wants=network-online.target
 # sway is NOT a dependency — the agent runs headlessly without a display server.
 # Display management (Phase 4) is handled by the agent itself after startup.
+# Limit restart attempts to avoid rapid cycling on misconfiguration.
+# StartLimitIntervalSec/Burst must live in [Unit], not [Service].
+StartLimitIntervalSec=60s
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -20,9 +24,6 @@ WorkingDirectory=/var/lib/hyperi
 EnvironmentFile=-/etc/hyperi/environment
 Restart=on-failure
 RestartSec=5s
-# Limit restart attempts to avoid rapid cycling on misconfiguration
-StartLimitIntervalSec=60s
-StartLimitBurst=3
 
 # Security hardening
 NoNewPrivileges=yes

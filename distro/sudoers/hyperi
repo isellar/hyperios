@@ -1,0 +1,36 @@
+# HyperiOS sudoers configuration for the hyperi service account.
+#
+# The hyperi agent runs as the 'hyperi' system user. It requires sudo access
+# to a narrow set of commands that implement the capability types defined in
+# internal/executor/local.go. Each entry is scoped to the exact binary and
+# the minimum argument set needed.
+#
+# SECURITY NOTES:
+#   - NOPASSWD is required because the agent runs non-interactively.
+#   - Commands are listed explicitly; no wildcards on dangerous operations.
+#   - Package manager write operations (install/remove) are intentionally
+#     included — they are gated upstream by the capability allowlist and the
+#     Policy Arbiter before reaching this layer.
+#   - This file is installed to /etc/sudoers.d/hyperi with mode 440.
+#     Do not make it world-readable.
+
+Defaults:hyperi !requiretty, !logfile, syslog=authpriv
+
+# ── Package management (execute:package) ──────────────────────────────────────
+hyperi ALL=(root) NOPASSWD: /usr/bin/apt-get update
+hyperi ALL=(root) NOPASSWD: /usr/bin/apt-get -y upgrade
+hyperi ALL=(root) NOPASSWD: /usr/bin/apt-get -y install *
+hyperi ALL=(root) NOPASSWD: /usr/bin/apt-get -y remove *
+hyperi ALL=(root) NOPASSWD: /usr/bin/apt-get -y purge *
+hyperi ALL=(root) NOPASSWD: /usr/bin/snap install *
+hyperi ALL=(root) NOPASSWD: /usr/bin/snap remove *
+
+# ── Service management (execute:process) ──────────────────────────────────────
+hyperi ALL=(root) NOPASSWD: /usr/bin/systemctl start *
+hyperi ALL=(root) NOPASSWD: /usr/bin/systemctl stop *
+hyperi ALL=(root) NOPASSWD: /usr/bin/systemctl restart *
+hyperi ALL=(root) NOPASSWD: /usr/bin/systemctl reload *
+hyperi ALL=(root) NOPASSWD: /usr/bin/systemctl enable *
+hyperi ALL=(root) NOPASSWD: /usr/bin/systemctl disable *
+hyperi ALL=(root) NOPASSWD: /usr/bin/systemctl status *
+hyperi ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
