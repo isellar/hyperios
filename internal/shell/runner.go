@@ -357,54 +357,56 @@ func synthesiseResponse(ctx context.Context, client llm.Completer, intent string
 		return "All steps were blocked or skipped — nothing was executed."
 	}
 
-	// Build a compact summary of outputs for the LLM
+	// Build a compact summary of outcomes for the LLM — always, even if all steps
+	// were skipped (e.g. "Chrome not found" is a valid answer to "what version of Chrome?")
 	var sb strings.Builder
 	sb.WriteString("Original intent: ")
 	sb.WriteString(intent)
-	sb.WriteString("\n\nStep outputs:\n")
+	sb.WriteString("\n\nStep outcomes:\n")
 
-	anyOutput := false
 	for _, r := range results {
 		sb.WriteString(fmt.Sprintf("\nStep [%s]: %s\n", r.step.ID, r.step.Description))
 		switch {
 		case r.skipped:
-			sb.WriteString("  Status: skipped — ")
-			sb.WriteString(r.reason)
-		case r.failed:
-			sb.WriteString("  Status: failed — ")
-			if r.result != nil {
-				sb.WriteString(r.result.Error)
+			// Strip internal validator boilerplate ("step %q: binary %q not found...") down
+			// to just the actionable part so the LLM doesn't echo implementation details.
+			reason := r.reason
+			if idx := strings.Index(reason, "not found in PATH"); idx != -1 {
+				reason = fmt.Sprintf("%q is not installed on this system", r.step.Command[0])
+			} else if idx := strings.Index(reason, "is not on the execute:shell allowlist"); idx != -1 {
+				reason = fmt.Sprintf("%q is not permitted by the capability allowlist", r.step.Command[0])
+			} else if strings.HasPrefix(reason, "skipped: exit status") {
+				reason = "command returned non-zero (package/binary not found)"
 			}
+			sb.WriteString(fmt.Sprintf("  Status: skipped — %s\n", reason))
+		case r.failed:
+			msg := ""
+			if r.result != nil {
+				msg = r.result.Error
+			}
+			sb.WriteString(fmt.Sprintf("  Status: failed — %s\n", msg))
 		case r.result != nil && r.result.Output != "":
-			sb.WriteString("  Output:\n")
-			// Truncate very long outputs to keep the LLM prompt manageable
 			out := r.result.Output
 			if len(out) > 4000 {
 				out = out[:4000] + "\n... (truncated)"
 			}
-			sb.WriteString(out)
-			anyOutput = true
+			sb.WriteString(fmt.Sprintf("  Output:\n%s\n", out))
 		default:
-			sb.WriteString("  Status: completed (no output)")
+			sb.WriteString("  Status: completed (no output)\n")
 		}
-		sb.WriteString("\n")
-	}
-
-	// If there's literally nothing to summarise, skip the LLM call
-	if !anyOutput {
-		return buildFallbackResponse(results)
 	}
 
 	system := `You are the response formatter for HyperiOS, an AI-driven OS agent.
 The agent has just executed a series of steps to fulfil a user's intent.
-Your job is to write a concise, direct answer to the user based on the step outputs.
+Your job is to write a concise, direct answer to the user based on the step outcomes.
 
 Rules:
-- Answer the original intent directly and completely.
-- Present data (numbers, tables, lists) clearly — use plain text formatting, not markdown headers.
-- Do not narrate what the agent did ("I ran df -h..."). Just give the answer.
-- If a step failed or was skipped, mention it briefly only if it affects the answer.
-- Keep it short: 1–10 lines for simple questions, longer only if the data requires it.`
+- Answer the original intent directly and completely — even if all steps were skipped or failed.
+- If nothing was found (e.g. a package is not installed), say so plainly: "Chrome is not installed on this system."
+- Present data (numbers, tables, lists) clearly — use plain text, not markdown headers or bullet symbols.
+- Do not narrate what the agent did ("I ran dpkg..."). Just give the answer.
+- Do not expose internal error messages or validator details to the user.
+- Keep it short: 1–6 lines for simple questions, longer only if the data requires it.`
 
 	response, err := client.CompleteWithRetry(ctx, system, sb.String())
 	if err != nil {

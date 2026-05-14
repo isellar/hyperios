@@ -87,6 +87,7 @@ type Model struct {
 	running   bool
 	sessionID string
 	runCount  int
+	planShown bool // true after the first plan:verdicts event; suppresses re-plan duplicates
 
 	// Approval prompt state
 	approval    *approvalRequestMsg
@@ -112,6 +113,10 @@ type Model struct {
 	voiceRecording bool
 	voiceSession   *voice.Session
 	voicePTTKey    string // e.g. "ctrl+space"
+
+	// Autonomy level (runtime-adjustable from the prompt)
+	autonomyLevel int
+	autonomySetFn func(int) // called when user changes level; persists to config
 }
 
 // PipelineRunner is the function the TUI calls when the user submits an intent.
@@ -127,8 +132,16 @@ type VoiceConfig struct {
 	PTTKey    string // e.g. "ctrl+space"
 }
 
+// AutonomyConfig holds runtime autonomy settings for the TUI.
+type AutonomyConfig struct {
+	Level int
+	// SetFn is called when the user changes the level at the prompt.
+	// It should persist the change and update the pipeline runner.
+	SetFn func(int)
+}
+
 // New creates a new TUI Model.
-func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, workspaceDir string, vc VoiceConfig) Model {
+func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, workspaceDir string, vc VoiceConfig, ac AutonomyConfig) Model {
 	// Text input
 	ti := textinput.New()
 	ti.Placeholder = "what do you want to do?"
@@ -157,6 +170,8 @@ func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, works
 		voiceModelPath: vc.ModelPath,
 		voiceCLIPath:   vc.CLIPath,
 		voicePTTKey:    pttKey,
+		autonomyLevel:  ac.Level,
+		autonomySetFn:  ac.SetFn,
 	}
 
 	// Subscribe to event bus
@@ -379,6 +394,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pipelineStartMsg:
 		m.running = true
 		m.runCount++
+		m.planShown = false // reset so the first plan block shows for this intent
 		m.appendBlank()
 		m.appendLine(outputLine{
 			text:  fmt.Sprintf("Running: %s", msg.intent),
@@ -513,17 +529,25 @@ func (m *Model) handleInput() tea.Cmd {
 	m.histIdx = -1
 
 	// Built-in commands
-	switch strings.ToLower(val) {
-	case "exit", "quit":
+	lower := strings.ToLower(val)
+	switch {
+	case lower == "exit" || lower == "quit":
 		return tea.Quit
-	case "clear":
+	case lower == "clear":
 		m.lines = nil
 		m.refreshViewport()
 		return nil
-	case "help":
+	case lower == "help":
 		m.appendHelp()
 		m.refreshViewport()
 		return nil
+	case lower == "autonomy":
+		m.appendAutonomyStatus()
+		m.refreshViewport()
+		return nil
+	case strings.HasPrefix(lower, "autonomy "):
+		arg := strings.TrimSpace(val[len("autonomy "):])
+		return m.handleAutonomySet(arg)
 	}
 
 	// Add to history
@@ -643,6 +667,12 @@ func (m *Model) handleBusEvent(e bus.Event) {
 
 	case bus.EventKind("plan:verdicts"):
 		if pv, ok := e.Payload.(*planVerdicts); ok && pv != nil {
+			if m.planShown {
+				// Re-plan: show a compact one-liner instead of re-printing the full plan
+				m.appendLine(outputLine{text: "  ↻ Re-planning...", style: styleSystem})
+				break
+			}
+			m.planShown = true
 			m.appendBlank()
 			m.appendLine(outputLine{text: "── Plan ─────────────────────────────────", style: stylePlanHeading})
 			verdictMap := map[string]types.ArbiterVerdict{}
@@ -733,7 +763,16 @@ func (m *Model) appendHelp() {
 	m.appendLine(outputLine{text: "HyperiOS Shell — built-in commands:", style: stylePlanHeading})
 	m.appendLine(outputLine{text: "  clear              clear the output area", style: styleOutput})
 	m.appendLine(outputLine{text: "  help               show this help", style: styleOutput})
+	m.appendLine(outputLine{text: "  autonomy           show current autonomy level", style: styleOutput})
+	m.appendLine(outputLine{text: "  autonomy <0-4>     change autonomy level", style: styleOutput})
 	m.appendLine(outputLine{text: "  exit / quit        exit the shell", style: styleOutput})
+	m.appendBlank()
+	m.appendLine(outputLine{text: "Autonomy levels:", style: stylePlanHeading})
+	m.appendLine(outputLine{text: "  0  observe    — show plan only, never execute", style: styleGray})
+	m.appendLine(outputLine{text: "  1  approved   — execute; modified verdicts require approval  (default)", style: styleOutput})
+	m.appendLine(outputLine{text: "  2  reversible — auto-approve reversible steps; approve others", style: styleOutput})
+	m.appendLine(outputLine{text: "  3  bounded    — auto-approve all pre-approved capabilities", style: styleOutput})
+	m.appendLine(outputLine{text: "  4  trusted    — execute everything the arbiter allows", style: styleGray})
 	m.appendBlank()
 	m.appendLine(outputLine{text: "Navigation:", style: stylePlanHeading})
 	m.appendLine(outputLine{text: "  ↑ / ↓             navigate command history (at prompt)", style: styleOutput})
@@ -745,6 +784,57 @@ func (m *Model) appendHelp() {
 	m.appendBlank()
 	m.appendLine(outputLine{text: "Anything else is sent to the agent pipeline as an intent.", style: styleSystem})
 	m.appendBlank()
+}
+
+func (m *Model) appendAutonomyStatus() {
+	m.appendLine(outputLine{
+		text:  fmt.Sprintf("autonomy: %d — %s", m.autonomyLevel, autonomyLevelText(m.autonomyLevel)),
+		style: styleSystem,
+	})
+}
+
+func (m *Model) handleAutonomySet(arg string) tea.Cmd {
+	n := 0
+	for _, c := range arg {
+		if c < '0' || c > '9' {
+			m.appendLine(outputLine{text: "  autonomy: must be a number 0–4", style: styleError})
+			m.refreshViewport()
+			return nil
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n < 0 || n > 4 {
+		m.appendLine(outputLine{text: "  autonomy: level must be 0–4", style: styleError})
+		m.refreshViewport()
+		return nil
+	}
+	m.autonomyLevel = n
+	if m.autonomySetFn != nil {
+		m.autonomySetFn(n)
+	}
+	m.appendLine(outputLine{
+		text:  fmt.Sprintf("  autonomy set to %d — %s", n, autonomyLevelText(n)),
+		style: styleStepOk,
+	})
+	m.refreshViewport()
+	return nil
+}
+
+func autonomyLevelText(level int) string {
+	switch level {
+	case 0:
+		return "observe (plan only, no execution)"
+	case 1:
+		return "approved (modified steps require approval)"
+	case 2:
+		return "reversible (auto-approve reversible steps)"
+	case 3:
+		return "bounded (auto-approve all allowlisted steps)"
+	case 4:
+		return "trusted (execute everything arbiter allows)"
+	default:
+		return "unknown"
+	}
 }
 
 func (m *Model) refreshViewport() {

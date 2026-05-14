@@ -56,10 +56,25 @@ IMPORTANT: Never use sudo with execute:shell. Package operations (apt-get, dpkg 
 Local service health checks (curl localhost) use execute:shell with "curl", not network:outbound.
 
 FAILURE POLICY — every step must include on_failure:
-  "halt"   — stop the session immediately if this step fails (use for critical prerequisites)
+  "halt"   — stop the session immediately (use only for critical prerequisites where later steps cannot proceed)
   "retry"  — retry the step; include max_retries (int) and retry_backoff_seconds (int)
-  "replan" — trigger a re-plan with the failure context (use when failure reveals new information)
-  "skip"   — continue to next step if this fails (use for non-critical steps)
+  "replan" — trigger a re-plan (use ONLY when a step fails in a way that requires a fundamentally different approach — e.g. a required service is down, a file doesn't exist that was expected to)
+  "skip"   — continue to the next step (use for ALL probe/fallback/query steps; non-zero exit codes from queries like dpkg, which, snap are NORMAL and should be skip, not replan)
+
+ON_FAILURE GUIDANCE — the most common mistake is using "replan" when "skip" is correct:
+  - "dpkg -l somepackage" exits 1 if the package is not installed — this is information, use "skip"
+  - "which somebinary" exits 1 if not found — this is information, use "skip"
+  - "snap list somepackage" exits 1 if not installed — this is information, use "skip"
+  - "google-chrome --version" failing because Chrome is not installed — use "skip"
+  - Any fallback step in a chain of alternatives — always use "skip"
+  - Only use "replan" if a step that was EXPECTED to succeed fails unexpectedly
+
+PACKAGE AND VERSION QUERIES — use these exact patterns:
+  To check if a deb package is installed:   ["dpkg-query", "-W", "-f=${Version}", "package-name"]
+  To check if a binary exists:              ["which", "binary-name"]  (on_failure: "skip")
+  To check snap packages:                   ["snap", "list", "package-name"]  (on_failure: "skip")
+  To check Chrome version via dpkg:         ["dpkg-query", "-W", "-f=${Version}", "google-chrome-stable"]
+  To check Chrome version via the binary:   ["google-chrome", "--version"]  — only use if "which google-chrome" succeeded first
 
 RULES:
 - Break goals into the minimal ordered steps needed to achieve them.
@@ -71,6 +86,7 @@ RULES:
 - Package installs, service restarts, config writes are NOT reversible (reversible:false).
 - Use "local" executor for all direct system operations.
 - Use "container" executor for untrusted code, sandboxed analysis, resource-intensive tasks.
+- For version/presence queries, prefer dpkg-query over dpkg -l: dpkg-query exits non-zero cleanly when a package is absent, and its output is easier to parse.
 
 Return ONLY valid JSON — no markdown fences, no explanation, no text before or after:
 

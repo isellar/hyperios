@@ -31,6 +31,7 @@ import (
 // Shell is the HyperiOS TUI entry point.
 type Shell struct {
 	config     *cfg.Config
+	configPath string // path to persist autonomy changes
 	eventBus   *bus.Bus
 	registry   *capability.Registry
 	validator  *capability.CommandValidator
@@ -47,6 +48,7 @@ type Shell struct {
 type Config struct {
 	APIKey        string
 	HypConfig     *cfg.Config
+	ConfigPath    string // path to persist config changes
 	EventBus      *bus.Bus
 	Registry      *capability.Registry
 	Validator     *capability.CommandValidator
@@ -62,6 +64,7 @@ type Config struct {
 func NewShell(c Config) *Shell {
 	return &Shell{
 		config:     c.HypConfig,
+		configPath: c.ConfigPath,
 		eventBus:   c.EventBus,
 		registry:   c.Registry,
 		validator:  c.Validator,
@@ -117,7 +120,17 @@ func (s *Shell) Run() error {
 		CLIPath:   s.config.WhisperCLIPath,
 		PTTKey:    s.config.VoicePushToTalkKey,
 	}
-	model := New(s.eventBus, runner, notifications, s.workDir, vc)
+	ac := AutonomyConfig{
+		Level: s.config.AutonomyLevel,
+		SetFn: func(level int) {
+			s.config.AutonomyLevel = level
+			// Persist to disk if we have a save path
+			if s.configPath != "" {
+				_ = cfg.Save(s.configPath, s.config)
+			}
+		},
+	}
+	model := New(s.eventBus, runner, notifications, s.workDir, vc, ac)
 
 	// Run bubbletea.
 	// WithMouseCellMotion is intentionally omitted: enabling bubbletea mouse

@@ -43,7 +43,9 @@ execute:shell:
   - curl
   - wget
   - dpkg
+  - dpkg-query
   - apt-cache
+  - snap
 
 # ── Git ────────────────────────────────────────────────────────────────────────
 execute:git:

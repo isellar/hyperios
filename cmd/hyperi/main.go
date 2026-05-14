@@ -238,6 +238,7 @@ func launchShell(cfg *config.Config) error {
 	s := shell.NewShell(shell.Config{
 		APIKey:        infra.apiKey,
 		HypConfig:     infra.cfg,
+		ConfigPath:    defaultConfigPath(),
 		EventBus:      infra.eventBus,
 		Registry:      infra.registry,
 		Validator:     infra.validator,
