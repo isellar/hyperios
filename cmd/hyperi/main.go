@@ -140,11 +140,24 @@ func bootstrap(cfg *config.Config) (*infra, error) {
 
 	allowlistPath := dataPathFn("allowlist.yaml")
 	if _, err := os.Stat(allowlistPath); os.IsNotExist(err) {
-		// Fall back to the repo-bundled allowlist
-		allowlistPath = "config/allowlist.yaml"
+		// Not in data dir yet — try to seed it from the repo-bundled copy,
+		// then fall back to the repo path directly if seeding fails.
+		repoAllowlist := findRepoAllowlist()
+		if repoAllowlist != "" {
+			// Copy it into the data dir so future runs find it there.
+			if data, readErr := os.ReadFile(repoAllowlist); readErr == nil {
+				_ = os.WriteFile(allowlistPath, data, 0o640)
+			}
+		}
+		// Re-check: use data dir copy if it now exists, else repo path, else give up.
+		if _, err2 := os.Stat(allowlistPath); os.IsNotExist(err2) {
+			if repoAllowlist != "" {
+				allowlistPath = repoAllowlist
+			}
+		}
 	}
 	if err := reg.LoadAllowlist(allowlistPath); err != nil {
-		// Non-fatal: restricted mode
+		// Non-fatal: restricted mode — all steps will require explicit grants.
 		fmt.Fprintf(os.Stderr, "Warning: could not load allowlist (%s): %v\n", allowlistPath, err)
 	}
 
@@ -710,6 +723,46 @@ func resolveLogDir() string {
 // defaultConfigPath returns the path to config.json.
 func defaultConfigPath() string {
 	return filepath.Join(resolveDataDir(), "config.json")
+}
+
+// findRepoAllowlist returns the path to the bundled config/allowlist.yaml by
+// searching from the executable location and known install paths.
+// Returns "" if not found.
+func findRepoAllowlist() string {
+	candidates := []string{
+		// Relative to the repo root when running from the checkout
+		"config/allowlist.yaml",
+		// Installed alongside the binary in /opt/hyperios
+		"/opt/hyperios/config/allowlist.yaml",
+		// Executable-relative: walk up from the binary to find a config/ dir
+		func() string {
+			exe, err := os.Executable()
+			if err != nil {
+				return ""
+			}
+			// Resolve symlinks (e.g. /usr/local/bin/hyperi -> actual path)
+			exe, _ = filepath.EvalSymlinks(exe)
+			// Walk up at most 3 levels looking for config/allowlist.yaml
+			dir := filepath.Dir(exe)
+			for i := 0; i < 3; i++ {
+				candidate := filepath.Join(dir, "config", "allowlist.yaml")
+				if _, err := os.Stat(candidate); err == nil {
+					return candidate
+				}
+				dir = filepath.Dir(dir)
+			}
+			return ""
+		}(),
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
 }
 
 // loadConfig loads the runtime config from the given path, or auto-detects it.
