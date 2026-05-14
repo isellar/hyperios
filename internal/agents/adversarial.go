@@ -66,7 +66,7 @@ func (a *AdversarialAgent) Run(ctx context.Context, graph *types.GoalGraph, plan
 		return nil, fmt.Errorf("adversarial agent: marshal input: %w", err)
 	}
 
-	raw, err := a.client.Complete(ctx, adversarialSystem, string(inJSON))
+	raw, err := a.client.CompleteWithRetry(ctx, adversarialSystem, string(inJSON))
 	if err != nil {
 		return nil, fmt.Errorf("adversarial agent: %w", err)
 	}

@@ -1,10 +1,13 @@
 # Binaries
 hyperi
 hyperi-*
-dist/
 
 # Build artifacts
-build/iso-work/
+build/
+dist/
+
+# Vagrant state
+.vagrant/
 
 # Environment
 .env

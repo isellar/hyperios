@@ -60,7 +60,7 @@ Workspace context:
 		indent(ws.GitStatus),
 	)
 
-	raw, err := a.client.Complete(ctx, intentSystem, user)
+	raw, err := a.client.CompleteWithRetry(ctx, intentSystem, user)
 	if err != nil {
 		return nil, fmt.Errorf("intent agent: %w", err)
 	}

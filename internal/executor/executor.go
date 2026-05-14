@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/isellar/hyperios/internal/bus"
 	"github.com/isellar/hyperios/internal/capability"
 	"github.com/isellar/hyperios/internal/types"
 )
@@ -16,6 +17,10 @@ type ExecutorConfig struct {
 	ExecutorType types.ExecutorType
 	Image        string
 	DockerHost   string
+	// Bus is the session event bus. When set, the executor publishes
+	// step lifecycle events. Optional — nil disables publishing.
+	Bus       *bus.Bus
+	SessionID string
 }
 
 func New(cfg ExecutorConfig) Executor {
@@ -30,7 +35,7 @@ func New(cfg ExecutorConfig) Executor {
 	case types.ExecutorContainer:
 		return NewContainer(cfg.Registry, cfg.Workspace, cfg.Image)
 	default:
-		return NewLocal(cfg.Registry, cfg.Workspace)
+		return NewLocal(cfg.Registry, cfg.Workspace, cfg.Bus, cfg.SessionID)
 	}
 }
 

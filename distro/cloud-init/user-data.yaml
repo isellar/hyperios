@@ -10,10 +10,12 @@ users:
     system: true
     shell: /bin/bash
     home: /var/lib/hyperi
-    groups: [audio, video, render, seat, input]
-    no-create-home: false
+    # sway: required for SWAYSOCK access (Phase 4)
+    # audio/video/render/seat/input: hardware access for voice and display phases
+    groups: [audio, video, render, seat, input, sway]
 
 # Install base packages
+# Note: network-manager provides nmcli; do not list nmcli separately
 packages:
   - sway
   - foot
@@ -22,30 +24,58 @@ packages:
   - curl
   - git
   - jq
-  - nmcli
+  - network-manager
   - flatpak
   - systemd-resolved
+  - inotify-tools
+  - at-spi2-core
+  # Voice (Phase 3) — STT via whisper.cpp
+  - alsa-utils       # provides arecord for audio capture
+  - build-essential  # needed to build whisper.cpp from source
+  - cmake            # whisper.cpp build system
+  # Display (Phase 4) — AT-SPI, screen capture, input injection
+  - at-spi2-core     # already listed above; AT-SPI D-Bus infrastructure
+  - grim             # already listed above; Wayland screenshot tool
+  - ydotool          # already listed above; input injection (last resort)
+  - gdbus-tools      # AT-SPI D-Bus queries (from dbus package)
 
 package_update: true
 package_upgrade: true
 
-# Create required directories
+# Create required directories and configure the system
 runcmd:
+  # Data directories
   - mkdir -p /var/lib/hyperi/sessions
+  - mkdir -p /var/lib/hyperi/plans
   - mkdir -p /var/log/hyperi
   - mkdir -p /etc/hyperi
   - chown -R hyperi:hyperi /var/lib/hyperi /var/log/hyperi
   - chmod 750 /var/lib/hyperi /var/log/hyperi
 
-  # Install hyperi binary (replace with actual release URL)
-  # - curl -Lo /usr/local/bin/hyperi https://github.com/isellar/hyperios/releases/latest/download/hyperi-linux-amd64
-  # - chmod +x /usr/local/bin/hyperi
+  # inotify watch limit — required for manifest watcher (Phase 1C)
+  - echo "fs.inotify.max_user_watches=524288" >> /etc/sysctl.d/90-hyperi.conf
+  - sysctl --system
 
   # Install sway config
+  # Note: in Vagrant, repo is at /vagrant; on real installs, copy manually or use release artifact
   - mkdir -p /etc/sway
-  - cp /opt/hyperios/distro/sway/config /etc/sway/config
+  - "[ -f /vagrant/distro/sway/config ] && cp /vagrant/distro/sway/config /etc/sway/config || true"
 
-  # Enable and start services
+  # Install sudoers config
+  - "[ -f /vagrant/distro/sudoers/hyperi ] && cp /vagrant/distro/sudoers/hyperi /etc/sudoers.d/hyperi && chmod 440 /etc/sudoers.d/hyperi || true"
+
+  # Install hyperi binary (replace with actual release URL when available)
+  # - curl -Lo /usr/local/bin/hyperi https://github.com/isellar/hyperios/releases/latest/download/hyperi-linux-amd64
+  # - chmod +x /usr/local/bin/hyperi
+  #
+  # For Vagrant dev: copy from shared folder
+  - "[ -f /vagrant/dist/hyperi-linux-amd64 ] && cp /vagrant/dist/hyperi-linux-amd64 /usr/local/bin/hyperi && chmod +x /usr/local/bin/hyperi || true"
+
+  # Install systemd service
+  - "[ -f /vagrant/distro/systemd/hyperi.service ] && cp /vagrant/distro/systemd/hyperi.service /etc/systemd/system/hyperi.service || true"
+  - systemctl daemon-reload
+
+  # Enable services — start ydotoold now; hyperi starts after API key is set
   - systemctl enable ydotoold
   - systemctl enable hyperi
   - systemctl start ydotoold
@@ -56,11 +86,22 @@ write_files:
     owner: root:hyperi
     content: |
       # HyperiOS environment configuration
-      # Set ANTHROPIC_API_KEY here or in /etc/hyperi/api-key
+      # Set ANTHROPIC_API_KEY here or provide it in /etc/hyperi/api-key
       HYPERI_DATA_DIR=/var/lib/hyperi
       HYPERI_LOG_DIR=/var/log/hyperi
       WAYLAND_DISPLAY=wayland-1
+      # Uncomment and set your API key:
+      # ANTHROPIC_API_KEY=sk-ant-...
+
+  - path: /etc/sysctl.d/90-hyperi.conf
+    permissions: '0644'
+    content: |
+      # Increase inotify watch limit for HyperiOS manifest watcher
+      fs.inotify.max_user_watches=524288
 
 final_message: |
   HyperiOS provisioning complete.
-  Set your Anthropic API key in /etc/hyperi/api-key before starting the agent.
+  Next steps:
+    1. Set your Anthropic API key in /etc/hyperi/environment (ANTHROPIC_API_KEY=...)
+    2. Copy the hyperi binary to /usr/local/bin/hyperi if not already present
+    3. Run: systemctl start hyperi

@@ -1,0 +1,73 @@
+#!/bin/bash
+# HyperiOS post-chroot setup hook
+# Runs inside the chroot during live-build.
+# Creates the hyperi system user, directories, sudoers, and services.
+
+set -euo pipefail
+
+echo "==> HyperiOS setup hook starting"
+
+# ── inotify limit ─────────────────────────────────────────────────────────────
+echo "fs.inotify.max_user_watches=524288" > /etc/sysctl.d/90-hyperi.conf
+
+# ── hyperi system user ────────────────────────────────────────────────────────
+if ! id hyperi &>/dev/null; then
+    useradd \
+        --system \
+        --shell /bin/bash \
+        --home-dir /var/lib/hyperi \
+        --create-home \
+        hyperi
+fi
+
+# Create sway group if needed
+getent group sway &>/dev/null || groupadd sway
+
+# Add hyperi to required groups
+usermod -aG audio,video,render,input,sway hyperi 2>/dev/null || true
+usermod -aG seat hyperi 2>/dev/null || true
+
+# ── Directories ───────────────────────────────────────────────────────────────
+mkdir -p /var/lib/hyperi/sessions
+mkdir -p /var/lib/hyperi/plans
+mkdir -p /var/lib/hyperi/models
+mkdir -p /var/log/hyperi
+mkdir -p /etc/hyperi
+
+chown -R hyperi:hyperi /var/lib/hyperi /var/log/hyperi
+chmod 770 /var/lib/hyperi /var/lib/hyperi/sessions /var/lib/hyperi/plans /var/log/hyperi
+
+# ── sudoers ───────────────────────────────────────────────────────────────────
+# Installed via overlay; validate here
+if [ -f /etc/sudoers.d/hyperi ]; then
+    chmod 440 /etc/sudoers.d/hyperi
+    visudo -c -f /etc/sudoers.d/hyperi
+fi
+
+# ── Environment file ──────────────────────────────────────────────────────────
+if [ ! -f /etc/hyperi/environment ]; then
+    cat > /etc/hyperi/environment << 'EOF'
+# HyperiOS environment — set API key here before first boot
+# ANTHROPIC_API_KEY=sk-ant-...
+HYPERI_DATA_DIR=/var/lib/hyperi
+HYPERI_LOG_DIR=/var/log/hyperi
+WAYLAND_DISPLAY=wayland-1
+EOF
+    chown root:hyperi /etc/hyperi/environment
+    chmod 640 /etc/hyperi/environment
+fi
+
+# ── Enable services ───────────────────────────────────────────────────────────
+systemctl enable hyperi.service 2>/dev/null || true
+systemctl enable ydotoold.service 2>/dev/null || true
+
+# ── GRUB tweaks ───────────────────────────────────────────────────────────────
+# Set a short timeout and clean title
+if [ -f /etc/default/grub ]; then
+    sed -i 's/GRUB_TIMEOUT=.*/GRUB_TIMEOUT=3/' /etc/default/grub
+    sed -i 's/GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="HyperiOS"/' /etc/default/grub
+    # Quiet boot — remove splash messages
+    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet"/' /etc/default/grub
+fi
+
+echo "==> HyperiOS setup hook complete"

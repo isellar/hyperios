@@ -1,6 +1,7 @@
 package capability
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -73,5 +74,47 @@ func TestEnforcer_SetGrantTTL(t *testing.T) {
 
 	if e.grantTTL != 2*time.Hour {
 		t.Errorf("expected TTL 2h, got %v", e.grantTTL)
+	}
+}
+
+func TestCapabilityNotGrantedError_ErrorsIs(t *testing.T) {
+	r := NewRegistry()
+	r.patterns["execute:shell"] = []string{"ls"}
+	e := NewEnforcer(r)
+	e.SetPromptEnabled(false)
+
+	step := types.ActionStep{
+		Capability: types.Capability{Type: "execute:shell", Scope: "rm"},
+	}
+
+	err := e.Validate(step)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// errors.Is must work via the Is() method
+	if !errors.Is(err, ErrCapabilityNotGranted) {
+		t.Errorf("errors.Is(err, ErrCapabilityNotGranted) = false, want true")
+	}
+
+	// errors.As must extract the typed error with Capability populated
+	var capErr *CapabilityNotGrantedError
+	if !errors.As(err, &capErr) {
+		t.Fatalf("errors.As failed to extract *CapabilityNotGrantedError")
+	}
+	if capErr.Capability.Type != "execute:shell" {
+		t.Errorf("expected capability type execute:shell, got %s", capErr.Capability.Type)
+	}
+	if capErr.Capability.Scope != "rm" {
+		t.Errorf("expected capability scope rm, got %s", capErr.Capability.Scope)
+	}
+
+	// Convenience helper
+	typed, ok := AsCapabilityNotGranted(err)
+	if !ok {
+		t.Error("AsCapabilityNotGranted returned false, want true")
+	}
+	if typed.Capability.Scope != "rm" {
+		t.Errorf("expected scope rm via helper, got %s", typed.Capability.Scope)
 	}
 }

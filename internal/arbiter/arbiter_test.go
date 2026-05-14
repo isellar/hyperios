@@ -3,6 +3,7 @@ package arbiter
 import (
 	"testing"
 
+	"github.com/isellar/hyperios/internal/config"
 	"github.com/isellar/hyperios/internal/types"
 )
 
@@ -197,6 +198,79 @@ func TestDecide_StepAppearsMultipleTimesInFlags(t *testing.T) {
 
 	if verdicts[0].Verdict != "modified" {
 		t.Errorf("expected 'modified' (high > low), got %q", verdicts[0].Verdict)
+	}
+}
+
+func TestDecide_AutonomyLevel0_AllModified(t *testing.T) {
+	plan := &types.ActionPlan{
+		Steps: []types.ActionStep{
+			{ID: "s1", Reversible: true},
+			{ID: "s2", Reversible: false},
+		},
+	}
+	report := &types.RiskReport{Flags: nil}
+	verdicts := NewWithLevel(config.AutonomyObserve).Decide(plan, report)
+
+	for _, v := range verdicts {
+		if v.Verdict != "modified" {
+			t.Errorf("level 0: expected all steps modified, got %q for %s", v.Verdict, v.StepID)
+		}
+		if v.Autonomy != config.AutonomyObserve {
+			t.Errorf("expected autonomy level recorded as 0, got %d", v.Autonomy)
+		}
+	}
+}
+
+func TestDecide_AutonomyLevel2_ReversibleAutoApproved(t *testing.T) {
+	plan := &types.ActionPlan{
+		Steps: []types.ActionStep{
+			{ID: "s1", Reversible: true},
+			{ID: "s2", Reversible: false},
+		},
+	}
+	report := &types.RiskReport{Flags: nil}
+	verdicts := NewWithLevel(config.AutonomyReversible).Decide(plan, report)
+
+	if verdicts[0].Verdict != "approved" {
+		t.Errorf("level 2: reversible step should be approved, got %q", verdicts[0].Verdict)
+	}
+	if verdicts[1].Verdict != "modified" {
+		t.Errorf("level 2: irreversible step should be modified, got %q", verdicts[1].Verdict)
+	}
+}
+
+func TestDecide_AutonomyLevel4_BlockOnlyBlocked(t *testing.T) {
+	plan := &types.ActionPlan{
+		Steps: []types.ActionStep{
+			{ID: "s1", Reversible: false},
+			{ID: "s2", Reversible: false},
+		},
+	}
+	report := &types.RiskReport{
+		Flags: []types.RiskFlag{
+			{StepID: "s1", Severity: "high", Description: "risky"},
+			{StepID: "s2", Severity: "block", Description: "dangerous"},
+		},
+	}
+	verdicts := NewWithLevel(config.AutonomyTrusted).Decide(plan, report)
+
+	if verdicts[0].Verdict != "approved" {
+		t.Errorf("level 4: high severity should still be approved, got %q", verdicts[0].Verdict)
+	}
+	if verdicts[1].Verdict != "blocked" {
+		t.Errorf("level 4: block severity should still be blocked, got %q", verdicts[1].Verdict)
+	}
+}
+
+func TestDecide_ArbiterRecordsAutonomyLevel(t *testing.T) {
+	plan := &types.ActionPlan{
+		Steps: []types.ActionStep{{ID: "s1", Reversible: true}},
+	}
+	report := &types.RiskReport{Flags: nil}
+	verdicts := NewWithLevel(3).Decide(plan, report)
+
+	if verdicts[0].Autonomy != 3 {
+		t.Errorf("expected autonomy level 3 recorded in verdict, got %d", verdicts[0].Autonomy)
 	}
 }
 

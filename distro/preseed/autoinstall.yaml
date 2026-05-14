@@ -1,0 +1,55 @@
+# HyperiOS unattended Ubuntu 24.04 Server install — Subiquity autoinstall format
+#
+# Usage: place this file at /autoinstall.yaml on a seed drive or pass via
+# boot parameter: autoinstall ds=nocloud;s=http://YOUR_SERVER/
+#
+# Reference: https://ubuntu.com/server/docs/install/autoinstall-reference
+#
+# To generate a password hash:
+#   openssl passwd -6 'yourpassword'
+
+version: 1
+
+locale: en_US.UTF-8
+keyboard:
+  layout: us
+
+network:
+  version: 2
+  ethernets:
+    any:
+      match:
+        name: "en*"
+      dhcp4: true
+
+storage:
+  layout:
+    name: lvm
+    # Adjust match for your target disk — 'largest' picks the biggest available
+    match:
+      size: largest
+
+identity:
+  hostname: hyperios
+  username: admin
+  # TODO: replace with a real hash: openssl passwd -6 'yourpassword'
+  password: "$6$rounds=4096$CHANGEME"
+
+ssh:
+  install-server: true
+  allow-pw: true
+
+packages:
+  - openssh-server
+  - curl
+  - git
+  - cloud-init
+
+# cloud-init will handle the rest (hyperi user, packages, service setup)
+# on first boot via distro/cloud-init/user-data.yaml
+late-commands:
+  - curtin in-target -- systemctl enable cloud-init cloud-init-local cloud-config cloud-final
+
+user-data:
+  # Disable root password login
+  disable_root: true

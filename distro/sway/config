@@ -1,6 +1,11 @@
 # HyperiOS sway compositor configuration
 # Kiosk-mode setup: HyperiOS Shell runs fullscreen in workspace 1.
 # Applications summoned by the agent appear in workspace 2+.
+#
+# Phase status:
+#   Phase 0/1: sway runs headless (WLR_BACKENDS=headless) for dev/testing
+#   Phase 2:   foot terminal launches with 'hyperi' TUI shell
+#   Phase 4:   full display management; agent summons apps into workspace 2+
 
 # ── Basics ─────────────────────────────────────────────────────────────────────
 set $mod Mod4
@@ -9,19 +14,28 @@ set $mod Mod4
 set $term foot
 
 # ── Output ────────────────────────────────────────────────────────────────────
-# Default output configuration — customise for your hardware
 output * bg #000000 solid_color
 
 # ── Workspaces ────────────────────────────────────────────────────────────────
 # Workspace 1: HyperiOS Shell (always fullscreen)
 # Workspace 2+: Agent-summoned applications
 
-# Launch HyperiOS shell on startup in workspace 1
-exec --no-startup-id swaymsg 'workspace 1; exec foot -e hyperi-shell'
+# Phase 2+: launch hyperi TUI shell on startup in workspace 1
+# Disabled until Phase 2 TUI is implemented — uncomment then
+# exec --no-startup-id swaymsg 'workspace 1; exec foot --title hyperi-shell -e hyperi'
+
+# Phase 0/1 dev: launch a plain terminal on startup
+exec --no-startup-id swaymsg 'workspace 1; exec foot'
+
+# ── IPC ───────────────────────────────────────────────────────────────────────
+# Allow hyperi daemon to control windows via swaymsg.
+# The hyperi user must be in the 'sway' group (set in cloud-init) and
+# SWAYSOCK must be set in /etc/hyperi/environment.
+# SWAYSOCK path is typically: /run/user/<UID>/sway-ipc.<UID>.<PID>.sock
 
 # ── Key bindings ──────────────────────────────────────────────────────────────
-# Voice activation (push-to-talk): hold Super+V
-bindsym $mod+v exec hyperi-listen
+# Voice activation (push-to-talk): hold Super+V — Phase 3
+# bindsym $mod+v exec hyperi-listen
 
 # Switch back to HyperiOS shell
 bindsym $mod+1 workspace 1
@@ -38,12 +52,8 @@ bindsym $mod+Shift+c reload
 # Exit sway
 bindsym $mod+Shift+e exec swaymsg exit
 
-# ── IPC ───────────────────────────────────────────────────────────────────────
-# Allow hyperi daemon to control windows via swaymsg
-# The hyperi user must be in the 'sway' group or SWAYSOCK must be accessible.
-
 # ── Status bar ────────────────────────────────────────────────────────────────
-# Minimal bar — shows only workspace indicator
+# Minimal bar — shows workspace indicator and time
 bar {
     position top
     status_command while date +'%H:%M'; do sleep 1; done
@@ -56,10 +66,10 @@ bar {
 }
 
 # ── Window rules ──────────────────────────────────────────────────────────────
-# Force hyperi shell to always be fullscreen in workspace 1
+# Phase 2+: force hyperi shell to always be fullscreen in workspace 1
 for_window [app_id="foot" title="hyperi-shell"] fullscreen enable
 
-# Agent-spawned apps go to workspace 2
+# Phase 4: agent-spawned apps go to workspace 2
 for_window [app_id="firefox"]  move to workspace 2
 for_window [app_id="chromium"] move to workspace 2
 for_window [app_id="gedit"]    move to workspace 2

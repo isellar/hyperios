@@ -119,6 +119,34 @@ func TestState_Progress_NilPlan(t *testing.T) {
 	}
 }
 
+func TestState_MarkCompleted_Idempotent(t *testing.T) {
+	state := NewState("test-id", "test intent", types.WorkspaceContext{})
+	state.Plan = &types.ActionPlan{
+		Steps: []types.ActionStep{
+			{ID: "s1"},
+			{ID: "s2"},
+		},
+	}
+
+	// Call MarkCompleted twice with the same ID
+	state.MarkCompleted("s1")
+	state.MarkCompleted("s1")
+
+	// Completed slice must not grow beyond 1 entry
+	if len(state.Completed) != 1 {
+		t.Errorf("expected 1 completed entry after double-mark, got %d", len(state.Completed))
+	}
+
+	// Progress must not overcount
+	completed, total := state.Progress()
+	if completed > total {
+		t.Errorf("Progress() overcount: completed=%d > total=%d", completed, total)
+	}
+	if completed != 1 {
+		t.Errorf("expected completed=1, got %d", completed)
+	}
+}
+
 func TestState_ToGoalGraph(t *testing.T) {
 	ctx := types.WorkspaceContext{Cwd: "/repo", GitBranch: "main"}
 	state := NewState("test-id", "my intent", ctx)

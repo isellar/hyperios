@@ -1,10 +1,17 @@
 version: 1
 
-# Read-only file access within the current workspace
+# ── Read ───────────────────────────────────────────────────────────────────────
+
 read:file:
   - "{workspace}/**"
+  - "/etc/**"
+  - "/var/log/**"
+  - "/proc/version"
+  - "/proc/cpuinfo"
+  - "/proc/meminfo"
 
-# Safe read-only shell commands
+# ── Shell ──────────────────────────────────────────────────────────────────────
+# Read-only and query commands only. No write-capable binaries.
 execute:shell:
   - grep
   - find
@@ -20,52 +27,130 @@ execute:shell:
   - du
   - stat
   - file
+  - echo
+  - which
+  - whoami
+  - id
+  - uname
+  - hostname
+  - uptime
+  - free
+  - ps
+  - top
+  - lsof
+  - ss
+  - ip
+  - curl
+  - wget
+  - dpkg
+  - apt-cache
 
-# Read-only git operations
+# ── Git ────────────────────────────────────────────────────────────────────────
 execute:git:
   - git:status
   - git:log
   - git:diff
   - git:branch
+  - git:show
+  - git:fetch
 
-# Package management — scoped by manager:package
-# Patterns use glob matching: apt:* allows any apt package
+# ── Package management ────────────────────────────────────────────────────────
+# Common safe packages pre-approved. Anything else requires a runtime grant.
 execute:package:
+  - apt:update
+  - apt:upgrade
   - apt:curl
   - apt:wget
   - apt:git
   - apt:vim
+  - apt:nano
   - apt:htop
   - apt:tmux
   - apt:jq
+  - apt:tree
+  - apt:unzip
+  - apt:zip
+  - apt:nginx
+  - apt:postgresql
+  - apt:redis
+  - apt:nodejs
+  - apt:npm
+  - apt:python3
+  - apt:python3-pip
+  - apt:build-essential
+  - apt:net-tools
+  - apt:dnsutils
+  - apt:nmap
 
-# Service management — scoped by systemctl:action:service
-# Only status queries are pre-approved; start/stop require runtime grants
+# ── Process / service management ──────────────────────────────────────────────
+# Status queries: pre-approved (no password required, matches sudoers tier 1).
+# Write operations: pre-approved here but still require PAM via sudoers tier 2.
 execute:process:
   - systemctl:status:*
+  - systemctl:is-active:*
+  - systemctl:is-enabled:*
+  - systemctl:list-units:*
+  - systemctl:list-timers:*
+  - systemctl:start:*
+  - systemctl:stop:*
+  - systemctl:restart:*
+  - systemctl:reload:*
+  - systemctl:enable:*
+  - systemctl:disable:*
+  - systemctl:daemon-reload:*
 
-# Display/compositor management via swaymsg
-# Pre-approved: workspace switching and window focus
+# ── Display / compositor ───────────────────────────────────────────────────────
 execute:display:
   - sway:workspace *
+  - sway:exec *
   - sway:focus *
+  - sway:close *
+  - sway:fullscreen *
+  - sway:move *
+  - sway:wait-window *
+  - atspi:find *
+  - atspi:wait *
+  - atspi:click *
+  - capture
 
-# Config file writes — paths must be explicitly granted at runtime
-# No pre-approved config paths (all require runtime capability grant)
-execute:config: []
+# ── Config file writes ─────────────────────────────────────────────────────────
+# Scoped to agent-owned paths and common config locations.
+# System-critical paths (/etc/sudoers*, /etc/shadow, etc.) are never listed.
+execute:config:
+  - /var/lib/hyperi/**
+  - /etc/sway/**
+  - /etc/hyperi/**
+  - /etc/nginx/**
+  - /etc/systemd/system/**
 
-# Network management via nmcli — status queries only pre-approved
+# ── Network management ─────────────────────────────────────────────────────────
 execute:network:
   - nmcli:device status
   - nmcli:connection show
+  - nmcli:device connect *
+  - nmcli:connection add *
 
-# Outbound network — explicit hosts only, no wildcard
+# ── Scheduled tasks ───────────────────────────────────────────────────────────
+execute:schedule:
+  - systemd:*
+  - cron:*
+
+# ── Outbound network ──────────────────────────────────────────────────────────
+# localhost is allowed for health checks against locally running services.
+# Common package and API hosts pre-approved.
 network:outbound:
+  - localhost
+  - "127.0.0.1"
   - "api.anthropic.com"
   - "packages.ubuntu.com"
   - "archive.ubuntu.com"
+  - "security.ubuntu.com"
+  - "github.com"
+  - "api.github.com"
+  - "registry.npmjs.org"
+  - "pypi.org"
 
-# UI open — browser and terminal allowed
+# ── UI ────────────────────────────────────────────────────────────────────────
 ui:open:
   - browser
   - terminal

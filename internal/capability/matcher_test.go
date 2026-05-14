@@ -20,7 +20,12 @@ func TestMatches(t *testing.T) {
 		{"empty pattern", "", "value", false},
 		{"empty value", "pattern", "", false},
 		{"double star matches path", "/repo/**", "/repo/main.go", true},
+		{"double star matches nested path", "/repo/**", "/repo/internal/agents/intent.go", true},
+		{"double star matches direct child", "/etc/**", "/etc/nginx", true},
 		{"double star no match", "/repo/**", "/other/main.go", false},
+		{"double star workspace prefix", "/home/user/**", "/home/user/docs/notes.txt", true},
+		{"double star suffix pattern", "**/intent.go", "internal/agents/intent.go", true},
+		{"double star suffix no match", "**/intent.go", "internal/agents/planner.go", false},
 		{"pattern with slash", "src/*.go", "src/main.go", true},
 	}
 

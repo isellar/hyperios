@@ -24,17 +24,18 @@ type Registry struct {
 // AllowlistConfig maps to config/allowlist.yaml.
 // Extended for HyperiOS Linux capabilities.
 type AllowlistConfig struct {
-	Version        int      `yaml:"version"`
-	ReadFile       []string `yaml:"read:file"`
-	ExecuteShell   []string `yaml:"execute:shell"`
-	ExecuteGit     []string `yaml:"execute:git"`
-	ExecutePackage []string `yaml:"execute:package"`
-	ExecuteProcess []string `yaml:"execute:process"`
-	ExecuteDisplay []string `yaml:"execute:display"`
-	ExecuteConfig  []string `yaml:"execute:config"`
-	ExecuteNetwork []string `yaml:"execute:network"`
+	Version         int      `yaml:"version"`
+	ReadFile        []string `yaml:"read:file"`
+	ExecuteShell    []string `yaml:"execute:shell"`
+	ExecuteGit      []string `yaml:"execute:git"`
+	ExecutePackage  []string `yaml:"execute:package"`
+	ExecuteProcess  []string `yaml:"execute:process"`
+	ExecuteDisplay  []string `yaml:"execute:display"`
+	ExecuteConfig   []string `yaml:"execute:config"`
+	ExecuteNetwork  []string `yaml:"execute:network"`
+	ExecuteSchedule []string `yaml:"execute:schedule"`
 	NetworkOutbound []string `yaml:"network:outbound"`
-	UIOpen         []string `yaml:"ui:open"`
+	UIOpen          []string `yaml:"ui:open"`
 }
 
 type GrantRecord struct {
@@ -84,6 +85,7 @@ func (r *Registry) LoadAllowlist(path string) error {
 		{"execute:display", cfg.ExecuteDisplay},
 		{"execute:config", cfg.ExecuteConfig},
 		{"execute:network", cfg.ExecuteNetwork},
+		{"execute:schedule", cfg.ExecuteSchedule},
 		{"network:outbound", cfg.NetworkOutbound},
 		{"ui:open", cfg.UIOpen},
 	}

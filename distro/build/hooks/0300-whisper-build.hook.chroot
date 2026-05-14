@@ -1,0 +1,40 @@
+#!/bin/bash
+# HyperiOS whisper.cpp build hook
+# Builds whisper-cli from source inside the chroot.
+# Requires build-essential and cmake (in package list).
+#
+# This produces a static-enough binary that works on the target system.
+
+set -euo pipefail
+
+WHISPER_DIR="/tmp/whisper-build"
+INSTALL_PATH="/usr/local/bin/whisper-cli"
+
+if [ -f "$INSTALL_PATH" ]; then
+    echo "==> whisper-cli already present at $INSTALL_PATH"
+    exit 0
+fi
+
+echo "==> Building whisper.cpp..."
+
+# Clone a specific release tag for reproducibility
+WHISPER_TAG="v1.7.5"
+git clone --depth 1 --branch "$WHISPER_TAG" \
+    https://github.com/ggml-org/whisper.cpp.git "$WHISPER_DIR" 2>/dev/null \
+    || git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git "$WHISPER_DIR"
+
+cd "$WHISPER_DIR"
+cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DWHISPER_BUILD_TESTS=OFF \
+    -DWHISPER_BUILD_EXAMPLES=ON \
+    -DWHISPER_NO_AVX2=ON \
+    2>&1 | tail -3
+
+cmake --build build --target whisper-cli -j4 2>&1 | tail -5
+
+cp build/bin/whisper-cli "$INSTALL_PATH"
+chmod +x "$INSTALL_PATH"
+rm -rf "$WHISPER_DIR"
+
+echo "==> whisper-cli installed at $INSTALL_PATH"

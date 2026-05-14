@@ -1,7 +1,9 @@
-# HyperiOS build tasks
+# HyperiOS build and dev tasks
 
-# Build for current platform
-dev:
+# ── Go ─────────────────────────────────────────────────────────────────────────
+
+# Build for current platform (dev use)
+build-local:
     go build -o hyperi ./cmd/hyperi
 
 # Cross-compile for Linux targets (primary deployment targets)
@@ -34,10 +36,48 @@ fmt:
 tidy:
     go mod tidy
 
-# Build ISO (requires live-build on Linux)
-iso:
+# ── Dev VM (Vagrant) ───────────────────────────────────────────────────────────
+
+# Spin up dev VM (Ubuntu 24.04, headless sway, cloud-init provisioned)
+dev:
+    vagrant up
+
+# SSH into dev VM
+dev-ssh:
+    vagrant ssh
+
+# Re-run provisioner without recreating VM (use after 'just build')
+dev-provision:
+    vagrant provision
+
+# Tear down dev VM cleanly
+dev-destroy:
+    vagrant destroy -f
+
+# Build binary and sync to VM in one step
+dev-deploy: build
+    vagrant provision
+
+# ── Distribution builds ────────────────────────────────────────────────────────
+
+# Build QEMU disk image for testing (faster than ISO; uses cloud-init base)
+# Requires: qemu-utils cloud-image-utils
+build-image: build
+    bash distro/build/build-image.sh
+
+# Build distributable ISO via live-build (requires Linux build host)
+# Requires: live-build debootstrap xorriso squashfs-tools
+# Run 'just build' first to produce the binary, then this.
+build-iso: build
     bash distro/build/build-iso.sh
+
+# Install live-build prerequisites on the build host
+install-build-deps:
+    sudo apt-get install -y live-build debootstrap xorriso squashfs-tools qemu-utils cloud-image-utils
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
 
 # Clean build artifacts
 clean:
-    rm -f hyperi dist/hyperi-*
+    rm -f hyperi
+    rm -rf dist/

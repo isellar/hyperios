@@ -2,6 +2,7 @@ package capability
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,15 @@ import (
 	"github.com/isellar/hyperios/internal/types"
 )
 
+// ErrCapabilityNotGranted is the sentinel error for capability denials.
+// Use errors.As (not errors.Is) to extract the Capability field:
+//
+//	var capErr *capability.CapabilityNotGrantedError
+//	if errors.As(err, &capErr) {
+//	    // capErr.Capability contains type and scope
+//	}
+//
+// errors.Is also works via the Is() method for simple presence checks.
 var ErrCapabilityNotGranted = &CapabilityNotGrantedError{}
 
 type CapabilityNotGrantedError struct {
@@ -18,6 +28,25 @@ type CapabilityNotGrantedError struct {
 
 func (e *CapabilityNotGrantedError) Error() string {
 	return fmt.Sprintf("capability not granted: %s %s", e.Capability.Type, e.Capability.Scope)
+}
+
+// Is makes errors.Is(err, ErrCapabilityNotGranted) work correctly.
+// Two CapabilityNotGrantedErrors are considered equal by type regardless of
+// which Capability they carry.
+func (e *CapabilityNotGrantedError) Is(target error) bool {
+	_, ok := target.(*CapabilityNotGrantedError)
+	return ok
+}
+
+// AsCapabilityNotGranted is a convenience wrapper around errors.As.
+// Returns the typed error and true if err is a CapabilityNotGrantedError,
+// allowing callers to access the denied Capability without a type assertion.
+func AsCapabilityNotGranted(err error) (*CapabilityNotGrantedError, bool) {
+	var e *CapabilityNotGrantedError
+	if errors.As(err, &e) {
+		return e, true
+	}
+	return nil, false
 }
 
 type Enforcer struct {

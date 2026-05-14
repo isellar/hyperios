@@ -1,0 +1,31 @@
+#!/bin/bash
+# HyperiOS whisper.cpp model download hook
+# Downloads the tiny.en model for push-to-talk voice input.
+# Runs inside the chroot during live-build.
+#
+# This hook is OPTIONAL — if network is unavailable during build,
+# it skips silently. The model can be downloaded on first boot instead.
+
+set -euo pipefail
+
+MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+MODEL_PATH="/var/lib/hyperi/models/ggml-tiny.en.bin"
+
+echo "==> Downloading whisper tiny.en model..."
+
+if [ -f "$MODEL_PATH" ]; then
+    echo "    Model already present at $MODEL_PATH"
+    exit 0
+fi
+
+mkdir -p /var/lib/hyperi/models
+
+# Try to download; if network unavailable, skip (non-fatal)
+if curl -fsSL --max-time 120 -o "$MODEL_PATH" "$MODEL_URL"; then
+    chown hyperi:hyperi "$MODEL_PATH"
+    echo "    Downloaded $(du -sh $MODEL_PATH | cut -f1) model to $MODEL_PATH"
+else
+    echo "    WARNING: Could not download whisper model (network unavailable during build)"
+    echo "    Run after first boot: curl -Lo $MODEL_PATH $MODEL_URL"
+    rm -f "$MODEL_PATH"
+fi
