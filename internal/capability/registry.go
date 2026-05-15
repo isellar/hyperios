@@ -2,6 +2,7 @@ package capability
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -200,7 +201,11 @@ func (r *Registry) saveGrants() {
 		return
 	}
 
-	os.WriteFile(r.grantsFile, data, 0600)
+	if err := os.WriteFile(r.grantsFile, data, 0600); err != nil {
+		// Log non-fatal write failure — grants will be lost on next restart
+		// but current session continues. Caller cannot recover from this.
+		fmt.Fprintf(os.Stderr, "Warning: failed to persist capability grants to %s: %v\n", r.grantsFile, err)
+	}
 }
 
 func (r *Registry) List() []types.Capability {

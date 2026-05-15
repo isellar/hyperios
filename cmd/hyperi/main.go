@@ -680,12 +680,10 @@ func runHeadless(cfg *config.Config, intent string, execute bool) error {
 
 // launchShellWithIntent opens the TUI shell with an intent pre-queued.
 // The intent is submitted automatically as the first command after the TUI
-// is ready. When intent is empty it just opens the shell normally.
+// is ready. "__resume__:<sessionID>" intents are passed directly to the
+// pipeline runner which handles them via resumeFromPlanDoc().
 func launchShellWithIntent(cfg *config.Config, intent string, _ bool) error {
-	// For now, set the intent as an env var that the shell model picks up on
-	// startup via the standard notification/startup path. Full pre-queue wiring
-	// (passing the intent directly to shell.Model) is left as Phase 2 polish.
-	if intent != "" && !strings.HasPrefix(intent, "__resume__:") {
+	if intent != "" {
 		os.Setenv("HYPERI_INITIAL_INTENT", intent)
 	}
 	return launchShell(cfg)

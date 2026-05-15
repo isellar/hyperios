@@ -150,7 +150,7 @@ func (s *Store) Lookup(path string) *PathEntry {
 	var bestMatch *PathEntry
 	bestLen := 0
 	for k, e := range s.manifest.Paths {
-		if strings.HasPrefix(path, k+"/") || strings.HasPrefix(path, k) {
+		if strings.HasPrefix(path, k+"/") || path == k {
 			if len(k) > bestLen {
 				bestLen = len(k)
 				bestMatch = e

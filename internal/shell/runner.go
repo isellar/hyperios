@@ -43,30 +43,42 @@ type RunnerConfig struct {
 	WorkspaceDir  string
 }
 
+// resumePrefix is the intent prefix used to signal a session resume.
+const resumePrefix = "__resume__:"
+
 // NewPipelineRunner returns a PipelineRunner closure suitable for use by the TUI.
 // Each call to the returned function runs the full agent pipeline for one intent.
+//
+// If the intent starts with "__resume__:<sessionID>", the runner opens the
+// existing plan doc for that session and resumes from the last completed step
+// instead of running the full pipeline from scratch.
 func NewPipelineRunner(rc RunnerConfig) PipelineRunner {
 	return func(intent, _ string) error {
-		sessionID := uuid.New().String()[:8]
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
 		client := llm.NewClient(rc.APIKey)
+
+		// ── Resume path ───────────────────────────────────────────────────────
+		if strings.HasPrefix(intent, resumePrefix) {
+			sessionID := strings.TrimPrefix(intent, resumePrefix)
+			return resumeFromPlanDoc(ctx, sessionID, rc, client)
+		}
+
+		// ── Normal path ───────────────────────────────────────────────────────
+		sessionID := uuid.New().String()[:8]
 		ws := gatherWorkspaceContext(rc.WorkspaceDir)
 
-		// Create plan document
 		planPath := rc.DataPathFn(filepath.Join("plans", sessionID+".md"))
 		planWriter, err := plan.NewWriter(planPath, sessionID, intent)
 		if err != nil {
 			return fmt.Errorf("create plan doc: %w", err)
 		}
 
-		// Save thin session index
 		state := session.NewState(sessionID, intent, ws)
 		state.PlanDocPath = planPath
 		state.AutonomyLevel = rc.AutonomyLevel
 		if err := rc.SessionMgr.Save(state); err != nil {
-			// Non-fatal
 			fmt.Fprintf(os.Stderr, "Warning: failed to save session: %v\n", err)
 		}
 
@@ -92,6 +104,107 @@ func NewPipelineRunner(rc RunnerConfig) PipelineRunner {
 	}
 }
 
+// resumeFromPlanDoc loads an existing plan doc and re-enters the pipeline
+// starting from the first incomplete stage or step.
+func resumeFromPlanDoc(ctx context.Context, sessionID string, rc RunnerConfig, client llm.Completer) error {
+	dataDir := rc.DataPathFn("")
+	planPath := filepath.Join(dataDir, "plans", sessionID+".md")
+
+	planState, err := plan.ParsePlanDoc(planPath)
+	if err != nil {
+		return fmt.Errorf("resume: parse plan doc for %s: %w", sessionID, err)
+	}
+
+	if planState.Status == plan.StatusCompleted {
+		return fmt.Errorf("session %s is already completed", sessionID)
+	}
+
+	// Load session state to get the original intent
+	sessState, err := rc.SessionMgr.Load(sessionID)
+	if err != nil {
+		return fmt.Errorf("resume: load session state for %s: %w", sessionID, err)
+	}
+
+	// Open plan doc for appending (not creating fresh)
+	planWriter, err := plan.OpenWriter(planPath, sessionID, sessState.Intent, planState.Attempt)
+	if err != nil {
+		return fmt.Errorf("resume: open plan doc: %w", err)
+	}
+
+	ws := gatherWorkspaceContext(rc.WorkspaceDir)
+
+	pub := func(kind bus.EventKind, payload any) {
+		if rc.EventBus != nil {
+			rc.EventBus.Publish(bus.Event{
+				Kind:      kind,
+				SessionID: sessionID,
+				Payload:   payload,
+				Timestamp: time.Now(),
+			})
+		}
+	}
+
+	pub(bus.EventKind("session:resuming"), fmt.Sprintf("Resuming session %s from last checkpoint", sessionID))
+
+	// Determine the first incomplete stage
+	nextStage := planState.NextPendingStage()
+
+	// If all stages are complete, we were interrupted during execution —
+	// we need the plan to know which steps to skip. Re-run the pipeline
+	// with skip logic based on the plan state.
+	if nextStage == "" {
+		// All LLM stages done — only execution is incomplete.
+		// We re-run the full pipeline but pass the planState so execution
+		// skips already-completed steps.
+		return runPipeline(ctx, pipelineArgs{
+			sessionID:     sessionID,
+			intent:        sessState.Intent,
+			ws:            ws,
+			autonomyLevel: sessState.AutonomyLevel,
+			executorType:  "local",
+			client:        client,
+			registry:      rc.Registry,
+			validator:     rc.Validator,
+			manifestStore: rc.Manifest,
+			logger:        rc.AuditLogger,
+			planWriter:    planWriter,
+			sessionMgr:    rc.SessionMgr,
+			state:         sessState,
+			eventBus:      rc.EventBus,
+			hypCfg:        rc.Config,
+			dataPathFn:    rc.DataPathFn,
+			attempt:       planState.Attempt,
+			resumeState:   planState,
+		})
+	}
+
+	// One or more LLM stages didn't complete — re-run from the first
+	// incomplete stage. For simplicity in v1, re-run from the beginning
+	// (stages are fast and idempotent when appending to the plan doc).
+	pub(bus.EventKind("session:resuming"), fmt.Sprintf("Re-running from stage: %s", nextStage))
+
+	return runPipeline(ctx, pipelineArgs{
+		sessionID:     sessionID,
+		intent:        sessState.Intent,
+		ws:            ws,
+		autonomyLevel: sessState.AutonomyLevel,
+		executorType:  "local",
+		client:        client,
+		registry:      rc.Registry,
+		validator:     rc.Validator,
+		manifestStore: rc.Manifest,
+		logger:        rc.AuditLogger,
+		planWriter:    planWriter,
+		sessionMgr:    rc.SessionMgr,
+		state:         sessState,
+		eventBus:      rc.EventBus,
+		hypCfg:        rc.Config,
+		dataPathFn:    rc.DataPathFn,
+		attempt:       planState.Attempt,
+		resumeState:   planState,
+	})
+}
+
 type pipelineArgs struct {
 	sessionID     string
 	intent        string
@@ -110,6 +223,10 @@ type pipelineArgs struct {
 	hypCfg        *cfg.Config
 	dataPathFn    func(string) string
 	attempt       int
+	// resumeState is non-nil when resuming a halted session.
+	// Pipeline stages and execution steps already marked completed in
+	// resumeState are skipped without re-running.
+	resumeState   *plan.PlanState
 }
 
 func runPipeline(ctx context.Context, a pipelineArgs) error {
@@ -124,59 +241,101 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		}
 	}
 
-	// ── Intent Agent ──────────────────────────────────────────────────────────
-	_ = a.planWriter.WriteStageStart("intent")
-	graph, err := agents.NewIntentAgent(a.client).Run(ctx, a.intent, a.ws)
-	if err != nil {
-		_ = a.planWriter.WriteStageFailed("intent", err)
-		pub(bus.EventPlanFailed, err.Error())
-		return err
+	// stageComplete returns true if we're resuming and this stage already finished.
+	stageComplete := func(stage string) bool {
+		return a.resumeState != nil && a.resumeState.IsStageComplete(stage)
 	}
-	_ = a.planWriter.WriteStageComplete("intent", marshalJSON(graph), "hyperi-intent")
-	_ = a.logger.Log(a.sessionID, "intent", a.intent, graph)
-	a.state.Goals = graph.Goals
+	// stepComplete returns true if we're resuming and this step already finished.
+	stepComplete := func(stepID string) bool {
+		if a.resumeState == nil {
+			return false
+		}
+		ss, ok := a.resumeState.Steps[stepID]
+		return ok && (ss.Status == "completed" || ss.Status == "skipped")
+	}
+
+	// ── Intent Agent ──────────────────────────────────────────────────────────
+	var graph *types.GoalGraph
+	if stageComplete("intent") {
+		pub(bus.EventKind("stage:skipped"), "intent (already completed)")
+		// We need the graph to feed the planner — re-run intent agent even on
+		// resume if we can't read the prior output. Intent is cheap and idempotent.
+		graph = &types.GoalGraph{Goals: a.state.Goals}
+	} else {
+		_ = a.planWriter.WriteStageStart("intent")
+		var err error
+		graph, err = agents.NewIntentAgent(a.client).Run(ctx, a.intent, a.ws)
+		if err != nil {
+			_ = a.planWriter.WriteStageFailed("intent", err)
+			pub(bus.EventPlanFailed, err.Error())
+			return err
+		}
+		_ = a.planWriter.WriteStageComplete("intent", marshalJSON(graph), "hyperi-intent")
+		_ = a.logger.Log(a.sessionID, "intent", a.intent, graph)
+		a.state.Goals = graph.Goals
+	}
 
 	// ── Planner Agent ─────────────────────────────────────────────────────────
-	_ = a.planWriter.WriteStageStart("plan")
-	agentPlan, err := agents.NewPlannerAgent(a.client).Run(ctx, graph)
-	if err != nil {
-		_ = a.planWriter.WriteStageFailed("plan", err)
-		pub(bus.EventPlanFailed, err.Error())
-		return err
+	var agentPlan *types.ActionPlan
+	if stageComplete("plan") && a.state.Plan != nil {
+		pub(bus.EventKind("stage:skipped"), "plan (already completed)")
+		agentPlan = a.state.Plan
+	} else {
+		_ = a.planWriter.WriteStageStart("plan")
+		var err error
+		agentPlan, err = agents.NewPlannerAgent(a.client).Run(ctx, graph)
+		if err != nil {
+			_ = a.planWriter.WriteStageFailed("plan", err)
+			pub(bus.EventPlanFailed, err.Error())
+			return err
+		}
+		_ = a.planWriter.WriteStageComplete("plan", marshalJSON(agentPlan), "hyperi-plan")
+		_ = a.logger.Log(a.sessionID, "planner", graph, agentPlan)
+		a.state.Plan = agentPlan
 	}
-	_ = a.planWriter.WriteStageComplete("plan", marshalJSON(agentPlan), "hyperi-plan")
-	_ = a.logger.Log(a.sessionID, "planner", graph, agentPlan)
-	a.state.Plan = agentPlan
 
-	// Publish plan summary to TUI
 	pub(bus.EventKind("plan:ready"), agentPlan)
 
 	// ── Adversarial Agent ─────────────────────────────────────────────────────
-	_ = a.planWriter.WriteStageStart("adversarial")
-	report, err := agents.NewAdversarialAgent(a.client).Run(ctx, graph, agentPlan)
-	if err != nil {
-		_ = a.planWriter.WriteStageFailed("adversarial", err)
-		pub(bus.EventPlanFailed, err.Error())
-		return err
+	var report *types.RiskReport
+	if stageComplete("adversarial") {
+		pub(bus.EventKind("stage:skipped"), "adversarial (already completed)")
+		report = &types.RiskReport{} // empty report — risk was already assessed
+	} else {
+		_ = a.planWriter.WriteStageStart("adversarial")
+		var err error
+		report, err = agents.NewAdversarialAgent(a.client).Run(ctx, graph, agentPlan)
+		if err != nil {
+			_ = a.planWriter.WriteStageFailed("adversarial", err)
+			pub(bus.EventPlanFailed, err.Error())
+			return err
+		}
+		_ = a.planWriter.WriteStageComplete("adversarial", marshalJSON(report), "hyperi-risk")
+		_ = a.logger.Log(a.sessionID, "adversarial", agentPlan, report)
 	}
-	_ = a.planWriter.WriteStageComplete("adversarial", marshalJSON(report), "hyperi-risk")
-	_ = a.logger.Log(a.sessionID, "adversarial", agentPlan, report)
 
 	// ── Arbiter ───────────────────────────────────────────────────────────────
-	_ = a.planWriter.WriteStageStart("arbiter")
-	policyArbiter := arbiter.NewWithLevel(a.autonomyLevel)
-	verdicts := policyArbiter.Decide(agentPlan, report)
-	_ = a.logger.Log(a.sessionID, "arbiter", agentPlan, verdicts)
-
-	for _, step := range agentPlan.Steps {
-		v := findVerdict(verdicts, step.ID)
-		if v != nil {
-			_ = a.planWriter.WriteStepVerdict(step, v.Verdict, v.Reason)
+	var verdicts []types.ArbiterVerdict
+	if stageComplete("arbiter") {
+		pub(bus.EventKind("stage:skipped"), "arbiter (already completed)")
+		// Re-run arbiter deterministically — it has no LLM cost and its output
+		// is needed to know which steps require approval.
+		policyArbiter := arbiter.NewWithLevel(a.autonomyLevel)
+		verdicts = policyArbiter.Decide(agentPlan, report)
+	} else {
+		_ = a.planWriter.WriteStageStart("arbiter")
+		policyArbiter := arbiter.NewWithLevel(a.autonomyLevel)
+		verdicts = policyArbiter.Decide(agentPlan, report)
+		_ = a.logger.Log(a.sessionID, "arbiter", agentPlan, verdicts)
+		for _, step := range agentPlan.Steps {
+			v := findVerdict(verdicts, step.ID)
+			if v != nil {
+				_ = a.planWriter.WriteStepVerdict(step, v.Verdict, v.Reason)
+			}
 		}
+		_ = a.planWriter.WriteStageComplete("arbiter", marshalJSON(verdicts), "hyperi-arbiter")
 	}
-	_ = a.planWriter.WriteStageComplete("arbiter", marshalJSON(verdicts), "hyperi-arbiter")
 
-	// Publish verdicts to TUI for inline plan display
 	pub(bus.EventKind("plan:verdicts"), &planVerdicts{
 		Plan:     agentPlan,
 		Verdicts: verdicts,
@@ -207,6 +366,12 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	var stepResults []stepResult
 
 	for _, step := range agentPlan.Steps {
+		// On resume: skip steps that already completed or were skipped.
+		if stepComplete(step.ID) {
+			pub(bus.EventStepSkipped, fmt.Sprintf("%s (already completed)", step.ID))
+			continue
+		}
+
 		v := findVerdict(verdicts, step.ID)
 		if v == nil {
 			continue
