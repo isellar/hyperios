@@ -47,7 +47,9 @@ func TestRegistry_Check_Allowlist(t *testing.T) {
 func TestRegistry_Check_Grants(t *testing.T) {
 	r := NewRegistry()
 	r.patterns["execute:shell"] = []string{"ls"}
-	r.grants["execute:shell:custom"] = time.Now().Add(time.Hour)
+	// Use capabilityKey() so the test always matches the current separator format.
+	r.grants[capabilityKey("execute:shell", "custom")] = time.Now().Add(time.Hour)
+	r.grants[capabilityKey("execute:shell", "expired")] = time.Now().Add(-time.Hour)
 
 	tests := []struct {
 		name     string
@@ -66,8 +68,6 @@ func TestRegistry_Check_Grants(t *testing.T) {
 		},
 	}
 
-	r.grants["execute:shell:expired"] = time.Now().Add(-time.Hour)
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := r.Check(tt.cap)
@@ -75,6 +75,43 @@ func TestRegistry_Check_Grants(t *testing.T) {
 				t.Errorf("expected %v, got %v", tt.expected, result)
 			}
 		})
+	}
+}
+
+func TestRegistry_GrantRoundTrip_MultiSegmentType(t *testing.T) {
+	// Regression test for Issue 2: parseCapabilityKey was using SplitN(key, ":", 2)
+	// which split "execute:shell:grep" into ("execute", "shell:grep") — losing the type.
+	// The fix uses a null-byte separator so multi-segment types survive round-trips.
+	dir := t.TempDir()
+	grantsFile := filepath.Join(dir, "grants.json")
+
+	r := NewRegistry()
+	r.grantsFile = grantsFile
+
+	multiSegmentCaps := []types.Capability{
+		{Type: "execute:shell", Scope: "grep"},
+		{Type: "execute:git", Scope: "git:status"},
+		{Type: "execute:package", Scope: "apt:nginx"},
+		{Type: "execute:process", Scope: "systemctl:restart:nginx"},
+		{Type: "network:outbound", Scope: "api.anthropic.com"},
+	}
+
+	// Grant all capabilities
+	for _, cap := range multiSegmentCaps {
+		r.Grant(cap, time.Hour)
+	}
+
+	// Load into a fresh registry from the persisted file
+	r2 := NewRegistry()
+	if err := r2.LoadGrants(grantsFile); err != nil {
+		t.Fatalf("LoadGrants: %v", err)
+	}
+
+	// Every capability must still be valid after round-trip
+	for _, cap := range multiSegmentCaps {
+		if !r2.Check(cap) {
+			t.Errorf("capability %s %s lost after grant round-trip", cap.Type, cap.Scope)
+		}
 	}
 }
 

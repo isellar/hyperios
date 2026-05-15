@@ -283,16 +283,25 @@ func (r *Registry) SaveGrants(path string) error {
 	return nil
 }
 
+// capabilityKeySep is the separator used in stored grant keys.
+// A null byte is used because capability types and scopes never contain it,
+// unlike ":" which appears in both (e.g. "execute:shell" type, "git:status" scope).
+const capabilityKeySep = "\x00"
+
 func capabilityKey(capType, scope string) string {
-	return capType + ":" + scope
+	return capType + capabilityKeySep + scope
 }
 
 func parseCapabilityKey(key string) (string, string) {
-	parts := strings.SplitN(key, ":", 2)
-	if len(parts) != 2 {
+	idx := strings.Index(key, capabilityKeySep)
+	if idx < 0 {
+		// Legacy key format using ":" as separator — attempt best-effort migration.
+		// This handles grants persisted before the separator change.
+		// We can't reliably split "execute:shell:grep" into type/scope,
+		// so we drop the grant and let it expire naturally.
 		return "", ""
 	}
-	return parts[0], parts[1]
+	return key[:idx], key[idx+1:]
 }
 
 func DefaultConfigPath() string {
