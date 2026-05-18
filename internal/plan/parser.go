@@ -2,8 +2,11 @@ package plan
 
 import (
 	"bufio"
+	"encoding/json"
 	"os"
 	"strings"
+
+	"github.com/isellar/hyperios/internal/types"
 )
 
 // StageStatus represents the execution state of a pipeline stage.
@@ -27,18 +30,20 @@ type StepState struct {
 // PlanState is the parsed state of a plan document.
 // Used by crash recovery and resume logic.
 type PlanState struct {
-	SessionID string
-	Status    string // document-level status from frontmatter
-	Attempt   int
-
-	// Stages contains the status of each pipeline stage, keyed by stage name.
-	Stages map[string]StageStatus
-
-	// Steps contains the execution state of each action step, keyed by step ID.
-	Steps map[string]StepState
-
-	// PendingApproval is the step ID of a step waiting for user approval, if any.
+	SessionID    string
+	Status       string // document-level status from frontmatter
+	Attempt      int
+	Stages       map[string]StageStatus
+	Steps        map[string]StepState
 	PendingApproval string
+
+	// Deserialized LLM outputs — populated from the "result" field of each
+	// stage's hyperi-meta block so they survive process restart even when the
+	// session state (Goals/Plan) is empty.
+	IntentGraph *types.GoalGraph
+	Plan        *types.ActionPlan
+	RiskReport  *types.RiskReport
+	Verdicts    []types.ArbiterVerdict
 }
 
 // ParsePlanDoc parses a plan document at path and returns the current execution state.
@@ -124,6 +129,34 @@ func (s *PlanState) processMeta(lines []string) {
 			Error:     fields["error"],
 		}
 		s.Stages[stage] = ss
+
+		// Deserialize LLM outputs stored in the "result" field.
+		// This lets the resume path re-populate graph/plan/report/verdicts
+		// without re-running the LLM stages.
+		if resultStr := fields["result"]; resultStr != "" {
+			switch stage {
+			case "intent":
+				var g types.GoalGraph
+				if json.Unmarshal([]byte(resultStr), &g) == nil {
+					s.IntentGraph = &g
+				}
+			case "plan":
+				var p types.ActionPlan
+				if json.Unmarshal([]byte(resultStr), &p) == nil {
+					s.Plan = &p
+				}
+			case "adversarial":
+				var r types.RiskReport
+				if json.Unmarshal([]byte(resultStr), &r) == nil {
+					s.RiskReport = &r
+				}
+			case "arbiter":
+				var v []types.ArbiterVerdict
+				if json.Unmarshal([]byte(resultStr), &v) == nil {
+					s.Verdicts = v
+				}
+			}
+		}
 		return
 	}
 

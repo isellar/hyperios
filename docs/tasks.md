@@ -1,6 +1,7 @@
 # HyperiOS — Implementation Tasks
 
 Phases 0–5 are complete and running on real hardware (OMNIUSPRIME, Ubuntu 24.04).
+Fast-path Phases 1–3 are complete. Phases 5A–5C (self-improving template generation) are complete.
 This document now tracks open bugs and next work items only.
 
 For the original phase-by-phase breakdown and decisions made during planning,
@@ -36,27 +37,31 @@ Bug fixes (post-review):
 - Issue 7: `execute:schedule` missing from `AllowlistConfig` — fixed
 - Issue 29: allowlist relative path — fixed by desktop (findRepoAllowlist)
 - Issues 4/5: container executor NL extraction + hardcoded grep pattern — fixed by desktop
+- Issue 10: resume path re-ran LLM stages unnecessarily — fixed (plan doc LLM output deserialization, stageComplete fallbacks)
+- Issue 11: manifest prefix match over-match — already correct; no fix needed
+- Issue 19: `saveGrants` write error silently ignored — already logs to stderr; no fix needed
+
+Fast-path implementation:
+- Phase 1: Intent Router + exact-match cache — ✓ (`internal/router/`, `internal/cache/`)
+- Phase 2: Template registry with 12 templates — ✓ (`config/templates.yaml`)
+- Phase 3: Promotion/demotion + guard conditions — ✓ (`internal/router/stats.go`)
+- Phase 5A: Single-slot template generation — ✓ (`internal/router/generator.go`)
+- Phase 5B: Multi-slot template generation — ✓ (extended generator.go)
+- Phase 5C: Self-tuning + lifecycle management — ✓ (SelfTune, Report/Tune/Health, template retirement)
+- Module interface defined — ✓ (`internal/module/module.go`)
+
+Test coverage added:
+- `internal/agents/` — Intent, Planner, Adversarial agent tests with mock Completer
+- `internal/config/` — Load, Save, Defaults, round-trip, AutonomyLevelText
+- `internal/cache/` — PlanCache persistence, TTL, LRU eviction, guard checks
+- `internal/plan/` — Writer unit tests, round-trip with parser
+- `internal/router/` — Template registry, stats, generator (single + multi-slot, self-tuning)
 
 ---
 
 ## Open — Active work
 
-### Fix Issue 10: `resumeSession()` restarts pipeline from scratch
-**Priority:** High — real-world friction on every halted session  
-**File:** `cmd/hyperi/main.go`  
-All the pieces exist (`ParsePlanDoc`, `NextPendingStep`, `NextPendingStage` in `internal/plan/parser.go`)
-but `resumeSession` re-runs the full Intent→Planner→Adversarial→Arbiter→Execute pipeline
-instead of picking up from the last completed step.
-
-### Fix Issue 11: manifest prefix match over-matches
-**Priority:** Medium  
-**File:** `internal/manifest/manifest.go:152`  
-`strings.HasPrefix(path, k)` matches `/etcother/foo` against key `/etc`. Fix: `|| path == k`.
-
-### Fix Issue 19: `SaveGrants()` write error silently ignored
-**Priority:** Low  
-**File:** `internal/capability/registry.go`  
-`os.WriteFile` error is discarded. Log it.
+*(All high/medium active bugs have been addressed. Remaining open items are tracked in the table below.)*
 
 ---
 
@@ -67,12 +72,15 @@ instead of picking up from the last completed step.
 | 3 | `internal/executor/local.go` | `vision:confirms` always returns true (stub) | Post-v1 |
 | 8 | `internal/display/atspi.go` | `Click()` always returns error | Post-v1 |
 | 9 | `internal/display/atspi.go` | AT-SPI walk is substring match on raw text | Post-v1 |
+| 10 | `internal/shell/runner.go` | Resume re-ran LLM stages unnecessarily — **fixed** | Done |
+| 11 | `internal/manifest/manifest.go` | Prefix match over-match — **already correct** | Done |
 | 12 | `internal/shell/model.go` | Split channel ownership on approval reply | Low |
 | 13 | `internal/plan/writer.go` | `strings.Title` deprecated | Low |
 | 14 | `internal/plan/writer.go` | Real exit code not captured in plan doc | Medium |
 | 15 | `internal/ui/server.go` | `handleIndex` dead code | Low |
 | 17 | `internal/ui/capture.go` | Uses `sh -c` with pipe (inconsistent with no-shell policy) | Low |
 | 18 | `cmd/hyperi/main.go` | `godotenv.Load()` error silently ignored | Low |
+| 19 | `internal/capability/registry.go` | `SaveGrants` write error silently ignored — **fixed** | Done |
 | 20 | `internal/executor/local.go` | Legacy NL extraction fallback dead code | Low |
 | 21 | `internal/shell/shell.go` | `processRunning()` Linux-only, no build tag | Low |
 | 28 | `internal/shell/model.go` | Voice push-to-talk hint not rendering in TUI | Medium |
@@ -83,11 +91,8 @@ instead of picking up from the last completed step.
 
 | Package | What's missing |
 |---|---|
-| `internal/agents/` | All three LLM agents — mock response parsing, validation, error handling |
 | `internal/executor/` | dispatch, retry, ReadyCondition polling, on_failure policy |
-| `internal/config/` | Load, Save, Defaults, round-trip |
 | `internal/shell/` | TUI model, pipeline runner |
-| `internal/plan/writer.go` | Writer unit tests |
 
 ---
 
@@ -104,3 +109,7 @@ See `docs/post-v1.md` for full details on each deferred item:
 - `vision:confirms` full implementation (LLM vision API)
 - AT-SPI `Click()` full implementation + real tree walk
 - ISO build artifact signing and hosting
+- Fast-path Phase 4: Semantic similarity (embedding-based intent matching)
+- Module interface expansion to all packages (arbiter, manifest, config, agents, executor)
+- Observation module (proactive system sensing)
+- Improvement module (retrospective analysis + proactive tuning)

@@ -1,0 +1,218 @@
+templates:
+  install_package:
+    name: install_package
+    patterns:
+      - "install (?P<package>[a-zA-Z0-9_.-]+)"
+      - "get (?P<package>[a-zA-Z0-9_.-]+)"
+      - "set up (?P<package>[a-zA-Z0-9_.-]+)"
+    plan:
+      name: install_package
+      steps:
+        - id: check_installed
+          description: "Check if {package} is installed"
+          capability:
+            type: "execute:shell"
+            scope: "dpkg-query"
+          command: ["dpkg-query", "-W", "-f=${{Version}}", "{package}"]
+          on_failure: skip
+        - id: install
+          description: "Install {package}"
+          capability:
+            type: "execute:package"
+            scope: "apt:{package}"
+          command: ["sudo", "apt-get", "-y", "install", "{package}"]
+          on_failure: halt
+          depends_on: [check_installed]
+
+  remove_package:
+    name: remove_package
+    patterns:
+      - "remove (?P<package>[a-zA-Z0-9_.-]+)"
+      - "uninstall (?P<package>[a-zA-Z0-9_.-]+)"
+    plan:
+      name: remove_package
+      steps:
+        - id: remove
+          description: "Remove {package}"
+          capability:
+            type: "execute:package"
+            scope: "apt:{package}"
+          command: ["sudo", "apt-get", "-y", "remove", "{package}"]
+          on_failure: halt
+
+  start_service:
+    name: start_service
+    patterns:
+      - "start (?P<service>[a-zA-Z0-9_.-]+)"
+      - "enable (?P<service>[a-zA-Z0-9_.-]+)"
+    plan:
+      name: start_service
+      steps:
+        - id: start
+          description: "Start {service} service"
+          capability:
+            type: "execute:process"
+            scope: "systemctl:start:{service}"
+          command: ["sudo", "systemctl", "start", "{service}"]
+          on_failure: halt
+
+  stop_service:
+    name: stop_service
+    patterns:
+      - "stop (?P<service>[a-zA-Z0-9_.-]+)"
+      - "disable (?P<service>[a-zA-Z0-9_.-]+)"
+    plan:
+      name: stop_service
+      steps:
+        - id: stop
+          description: "Stop {service} service"
+          capability:
+            type: "execute:process"
+            scope: "systemctl:stop:{service}"
+          command: ["sudo", "systemctl", "stop", "{service}"]
+          on_failure: halt
+
+  restart_service:
+    name: restart_service
+    patterns:
+      - "restart (?P<service>[a-zA-Z0-9_.-]+)"
+    plan:
+      name: restart_service
+      steps:
+        - id: restart
+          description: "Restart {service} service"
+          capability:
+            type: "execute:process"
+            scope: "systemctl:restart:{service}"
+          command: ["sudo", "systemctl", "restart", "{service}"]
+          on_failure: halt
+
+  check_service_status:
+    name: check_service_status
+    patterns:
+      - "is (?P<service>[a-zA-Z0-9_.-]+) running"
+      - "status of (?P<service>[a-zA-Z0-9_.-]+)"
+      - "check (?P<service>[a-zA-Z0-9_.-]+) status"
+    plan:
+      name: check_service_status
+      steps:
+        - id: status
+          description: "Check status of {service}"
+          capability:
+            type: "execute:process"
+            scope: "systemctl:status:{service}"
+          command: ["systemctl", "is-active", "{service}"]
+          on_failure: skip
+
+  open_url:
+    name: open_url
+    patterns:
+      - "open (?P<url>https?://[^\s]+)"
+      - "go to (?P<url>https?://[^\s]+)"
+      - "visit (?P<url>https?://[^\s]+)"
+    plan:
+      name: open_url
+      steps:
+        - id: open
+          description: "Open {url} in browser"
+          capability:
+            type: "ui:open"
+            scope: "browser"
+          command: ["xdg-open", "{url}"]
+          on_failure: halt
+
+  check_disk_space:
+    name: check_disk_space
+    patterns:
+      - "check disk space"
+      - "disk usage"
+      - "how much disk space"
+      - "disk space"
+    plan:
+      name: check_disk_space
+      steps:
+        - id: disk
+          description: "Check disk space"
+          capability:
+            type: "execute:shell"
+            scope: "df"
+          command: ["df", "-h", "--total"]
+          on_failure: halt
+
+  check_memory:
+    name: check_memory
+    patterns:
+      - "check memory"
+      - "memory usage"
+      - "how much memory"
+      - "ram usage"
+    plan:
+      name: check_memory
+      steps:
+        - id: memory
+          description: "Check memory usage"
+          capability:
+            type: "execute:shell"
+            scope: "free"
+          command: ["free", "-h"]
+          on_failure: halt
+
+  list_processes:
+    name: list_processes
+    patterns:
+      - "list processes"
+      - "running processes"
+      - "what is running"
+    plan:
+      name: list_processes
+      steps:
+        - id: processes
+          description: "List running processes"
+          capability:
+            type: "execute:shell"
+            scope: "ps"
+          command: ["ps", "aux", "--sort=-%mem"]
+          on_failure: halt
+
+  kill_process:
+    name: kill_process
+    patterns:
+      - "kill (?P<process>[a-zA-Z0-9_.-]+)"
+      - "stop process (?P<process>[a-zA-Z0-9_.-]+)"
+      - "terminate (?P<process>[a-zA-Z0-9_.-]+)"
+    plan:
+      name: kill_process
+      steps:
+        - id: kill
+          description: "Kill {process} process"
+          capability:
+            type: "execute:shell"
+            scope: "pkill"
+          command: ["pkill", "-f", "{process}"]
+          on_failure: halt
+
+  update_system:
+    name: update_system
+    patterns:
+      - "update system"
+      - "update packages"
+      - "upgrade system"
+      - "apt update"
+    plan:
+      name: update_system
+      steps:
+        - id: update
+          description: "Update package lists"
+          capability:
+            type: "execute:package"
+            scope: "apt:update"
+          command: ["sudo", "apt-get", "update"]
+          on_failure: halt
+        - id: upgrade
+          description: "Upgrade installed packages"
+          capability:
+            type: "execute:package"
+            scope: "apt:upgrade"
+          command: ["sudo", "apt-get", "-y", "upgrade"]
+          on_failure: halt
+          depends_on: [update]

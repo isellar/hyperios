@@ -147,6 +147,24 @@ The plan doc already records every executed command — the hybrid approach adds
 
 ---
 
+## Module Architecture
+
+### Module Interface Expansion
+**Status:** Phase 5C implemented the `Module` interface (`Report`, `Tune`, `Health`) on the Generator. The interface is defined in `internal/module/module.go`.  
+**Next:** Expand to remaining packages: arbiter, manifest, config, agents, executor. This enables the Improvement module to observe and tune all modules uniformly.
+
+### Observation Module
+**Status:** Not started.  
+**What it is:** Proactive system sensing — filesystem state, process state, network state, service health — separate from user I/O. Currently scattered across manifest watcher, scheduler, etc.  
+**Why deferred:** The manifest + inotify + scheduler provide the foundation. Extracting into a coherent `internal/observation/` package is the next step.
+
+### Improvement Module
+**Status:** Not started.  
+**What it is:** Retrospective analysis of execution history, proactive tuning of module parameters. The Generator's self-tuning (Phase 5C) is the first instance of this pattern.  
+**Why deferred:** Needs the Module interface expanded to all packages first. The Improvement module consumes `Report` from all modules and produces `Tune` changes.
+
+---
+
 ## Known Bugs (Inherited, Not Yet Fixed)
 
 These are carry-overs from the prior "Uplink" codebase. They are not post-v1 features — they are bugs that need fixing in Phase 1. Listed here as a reminder that they exist and shouldn't be forgotten during planning.

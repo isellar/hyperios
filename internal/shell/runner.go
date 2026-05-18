@@ -258,9 +258,13 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	var graph *types.GoalGraph
 	if stageComplete("intent") {
 		pub(bus.EventKind("stage:skipped"), "intent (already completed)")
-		// We need the graph to feed the planner — re-run intent agent even on
-		// resume if we can't read the prior output. Intent is cheap and idempotent.
-		graph = &types.GoalGraph{Goals: a.state.Goals}
+		graph = a.state.ToGoalGraph()
+		if len(graph.Goals) == 0 && a.resumeState != nil {
+			graph = a.resumeState.IntentGraph
+		}
+		if graph == nil || len(graph.Goals) == 0 {
+			return fmt.Errorf("resume state has no intent graph: session state Goals and plan doc result are both empty")
+		}
 	} else {
 		_ = a.planWriter.WriteStageStart("intent")
 		var err error
@@ -277,9 +281,15 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 
 	// ── Planner Agent ─────────────────────────────────────────────────────────
 	var agentPlan *types.ActionPlan
-	if stageComplete("plan") && a.state.Plan != nil {
+	if stageComplete("plan") {
 		pub(bus.EventKind("stage:skipped"), "plan (already completed)")
 		agentPlan = a.state.Plan
+		if agentPlan == nil && a.resumeState != nil {
+			agentPlan = a.resumeState.Plan
+		}
+		if agentPlan == nil {
+			return fmt.Errorf("resume state has no action plan: session state Plan and plan doc result are both empty")
+		}
 	} else {
 		_ = a.planWriter.WriteStageStart("plan")
 		var err error
@@ -300,7 +310,10 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	var report *types.RiskReport
 	if stageComplete("adversarial") {
 		pub(bus.EventKind("stage:skipped"), "adversarial (already completed)")
-		report = &types.RiskReport{} // empty report — risk was already assessed
+		report = &types.RiskReport{}
+		if a.resumeState != nil && a.resumeState.RiskReport != nil {
+			report = a.resumeState.RiskReport
+		}
 	} else {
 		_ = a.planWriter.WriteStageStart("adversarial")
 		var err error
@@ -316,12 +329,9 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 
 	// ── Arbiter ───────────────────────────────────────────────────────────────
 	var verdicts []types.ArbiterVerdict
-	if stageComplete("arbiter") {
+	if stageComplete("arbiter") && a.resumeState != nil && len(a.resumeState.Verdicts) > 0 {
 		pub(bus.EventKind("stage:skipped"), "arbiter (already completed)")
-		// Re-run arbiter deterministically — it has no LLM cost and its output
-		// is needed to know which steps require approval.
-		policyArbiter := arbiter.NewWithLevel(a.autonomyLevel)
-		verdicts = policyArbiter.Decide(agentPlan, report)
+		verdicts = a.resumeState.Verdicts
 	} else {
 		_ = a.planWriter.WriteStageStart("arbiter")
 		policyArbiter := arbiter.NewWithLevel(a.autonomyLevel)

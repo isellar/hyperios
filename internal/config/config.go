@@ -69,6 +69,24 @@ type Config struct {
 	// VoicePushToTalkKey is the key binding for push-to-talk recording.
 	// Default: "ctrl+space"
 	VoicePushToTalkKey string `json:"voice_push_to_talk_key,omitempty"`
+
+	// GeneratorConfig controls template generation behavior.
+	Generator GeneratorConfig `json:"generator,omitempty"`
+}
+
+// GeneratorConfig controls the self-improvement template generator.
+type GeneratorConfig struct {
+	// MinClusterSize is the minimum number of plans needed to form a cluster.
+	// Default: 3
+	MinClusterSize int `json:"min_cluster_size"`
+
+	// MinSuccessRate is the minimum success rate for source plans.
+	// Default: 0.8
+	MinSuccessRate float64 `json:"min_success_rate"`
+
+	// AutoApprove deploys generated templates without user review.
+	// Default: false
+	AutoApprove bool `json:"auto_approve"`
 }
 
 // Defaults returns a Config with safe default values for a fresh install.
@@ -87,6 +105,12 @@ func Defaults() *Config {
 		WhisperCLIPath:     "/usr/local/bin/whisper-cli",
 		VoiceEnabled:       false, // opt-in; user enables after verifying audio works
 		VoicePushToTalkKey: "ctrl+space",
+		// Generator defaults
+		Generator: GeneratorConfig{
+			MinClusterSize: 3,
+			MinSuccessRate: 0.8,
+			AutoApprove:    false,
+		},
 	}
 }
 

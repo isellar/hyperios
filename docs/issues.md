@@ -87,19 +87,19 @@ The method finds the element but then returns an error saying "not yet fully imp
 **Fix (Phase 4+):** Implement a real recursive AT-SPI tree walk using the `org.a11y.atspi.Accessible.GetChildren` call per node.
 
 ### Issue 10: `resumeSession()` ignores parsed plan state, restarts pipeline from scratch
-**File:** `cmd/hyperi/main.go:319–336`  
-**Severity:** Medium — `hyperi session resume <id>` runs the full pipeline again (Intent → Planner → Adversarial → Arbiter → Execute) from scratch. The parsed `planState` variable at line 327 is read but never used to inform where to resume from. All the Phase 1B work for crash recovery (`NextPendingStep`, `NextPendingStage`) is implemented in `internal/plan/parser.go` but never called from `resumeSession`.
+**File:** `cmd/hyperi/main.go:319–336` (now `buildSessionResumeCmd`) and `internal/shell/runner.go:107–206`
+**Severity:** Medium — `hyperi session resume <id>` ran the full pipeline again from scratch.
 
-**Fix:** Wire `plan.ParsePlanDoc` result into the runner to skip completed stages/steps.
+**Fix (done):** `runner.go` now deserializes LLM outputs (`GoalGraph`, `ActionPlan`, `RiskReport`, `Verdicts`) from the plan doc's hyperi-meta result fields during `ParsePlanDoc`. On resume with all LLM stages complete, `stageComplete()` uses `resumeState.IntentGraph` / `resumeState.Plan` / `resumeState.RiskReport` / `resumeState.Verdicts` instead of requiring `a.state.Goals`/`a.state.Plan` which are empty after process restart. `parser.go:PlanState` now has `IntentGraph`, `Plan`, `RiskReport`, and `Verdicts` fields populated by `processMeta`. `runner.go:stageComplete("intent")` now falls back to `a.resumeState.IntentGraph` when `a.state.Goals` is empty, and similarly for the plan, adversarial, and arbiter stages. The resume path re-enters `runPipeline` with the parsed state; the `stageComplete` guards and deserialized LLM outputs ensure LLM stages are skipped without re-prompting.
 
 ### Issue 11: Manifest prefix match can over-match without trailing slash
-**File:** `internal/manifest/manifest.go:152`  
+**File:** `internal/manifest/manifest.go:152`
 
 ```go
-strings.HasPrefix(path, k+"/") || strings.HasPrefix(path, k)
+strings.HasPrefix(path, k+"/") || path == k
 ```
 
-The second clause matches `/etcother/nginx.conf` against the key `/etc`. Should be `strings.HasPrefix(path, k+"/") || path == k`.
+The code at line 153 already uses the correct form (`|| path == k`, not `|| strings.HasPrefix(path, k)`). `/etcother/nginx.conf` does **not** match manifest key `/etc` because `"/etcother"` does not start with `"/etc/"`. This issue is already fixed.
 
 ---
 
@@ -137,8 +137,8 @@ Uses `exec.Command("sh", "-c", "grim -t png - | base64 -w 0")` — inconsistent 
 A malformed `.env` file will not produce any diagnostic. Non-blocking in practice but worth logging.
 
 ### Issue 19: `registry.SaveGrants()` write error silently ignored
-**File:** `internal/capability/registry.go` (around `SaveGrants`)  
-`os.WriteFile` error is discarded. A failed write loses all runtime capability grants silently.
+**File:** `internal/capability/registry.go:204–207`  
+`os.WriteFile` error was previously discarded. The write error is now logged to stderr: `fmt.Fprintf(os.Stderr, "Warning: failed to persist capability grants to %s: %v\n", r.grantsFile, err)`. This issue is already fixed.
 
 ### Issue 20: Legacy NL extraction fallback still present in `executeShell()`
 **File:** `internal/executor/local.go:307–343`  
@@ -152,25 +152,25 @@ Checks `/proc/<pid>` — Linux-specific. No `//go:build linux` tag. On macOS/Win
 
 ## Missing Test Coverage
 
-### Issue 22: Zero test coverage on Intent, Planner, Adversarial agents
+### Issue 22: Zero test coverage on Intent, Planner, Adversarial agents — **FIXED**
 **File:** `internal/agents/`  
-All three LLM-calling agents have no test files. Mock LLM responses should be used to test JSON parsing, validation, and error handling paths.
+Tests added: `intent_test.go`, `planner_test.go`, `adversarial_test.go`, `mock_test.go`. Mock `Completer` used to test JSON parsing, validation, and error handling.
 
 ### Issue 23: Zero test coverage on executor (local + container)
 **File:** `internal/executor/`  
 The most critical runtime path — dispatch, retry, ReadyCondition polling, on_failure policy — has no tests.
 
-### Issue 24: Zero test coverage on config package
+### Issue 24: Zero test coverage on config package — **FIXED**
 **File:** `internal/config/`  
-`Load`, `Save`, `Defaults`, round-trip behaviour — untested.
+Tests added: `config_test.go`. Covers `Load`, `Save`, `Defaults`, round-trip, `AutonomyLevelText`.
 
 ### Issue 25: Zero test coverage on TUI shell and pipeline runner
 **File:** `internal/shell/`  
 TUI model and pipeline runner have no tests.
 
-### Issue 26: `plan/writer.go` has no unit tests
+### Issue 26: `plan/writer.go` has no unit tests — **FIXED**
 **File:** `internal/plan/writer.go`  
-Tasks.md explicitly listed writer unit tests as a Phase 1B deliverable. Not done.
+Tests added: `writer_test.go`. Covers header format, stage start/complete/failed blocks, step results, round-trip with parser.
 
 ### Issue 27: `capability/enforcer_test.go` missing struct-field assertion
 **File:** `internal/capability/enforcer_test.go`  
@@ -202,3 +202,7 @@ See original description above.
 - AT-SPI `Click()` full implementation — deferred
 - Real AT-SPI tree walk — deferred
 - ISO build artifact signing and hosting — deferred
+- Fast-path Phase 4: Semantic similarity (embedding-based intent matching) — deferred
+- Module interface expansion to all packages — Phase 5C implemented on Generator only
+- Observation module (proactive system sensing) — not started
+- Improvement module (retrospective analysis + proactive tuning) — not started

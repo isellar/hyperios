@@ -332,11 +332,25 @@ func (s *Store) ScanPath(path string) {
 // in the given command. Called by the executor after each step.
 func (s *Store) PostExecutionHook(command []string) {
 	for _, arg := range command {
-		if strings.HasPrefix(arg, "/") {
-			// Looks like an absolute path
+		if isAbsolutePath(arg) {
 			if _, err := os.Stat(arg); err == nil {
 				s.ScanPath(arg)
 			}
 		}
 	}
+}
+
+// isAbsolutePath reports whether arg is an absolute filesystem path.
+// Handles both Unix (/foo) and Windows (C:\foo) forms.
+func isAbsolutePath(arg string) bool {
+	if strings.HasPrefix(arg, "/") {
+		return true
+	}
+	if len(arg) >= 2 && arg[1] == ':' {
+		c := arg[0]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return len(arg) >= 3 && arg[2] == '\\'
+		}
+	}
+	return false
 }

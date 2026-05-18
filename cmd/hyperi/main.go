@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,10 +23,12 @@ import (
 
 	"github.com/isellar/hyperios/internal/audit"
 	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/cache"
 	"github.com/isellar/hyperios/internal/capability"
 	"github.com/isellar/hyperios/internal/config"
 	"github.com/isellar/hyperios/internal/manifest"
 	"github.com/isellar/hyperios/internal/plan"
+	"github.com/isellar/hyperios/internal/router"
 	"github.com/isellar/hyperios/internal/scheduler"
 	"github.com/isellar/hyperios/internal/session"
 	"github.com/isellar/hyperios/internal/shell"
@@ -84,6 +87,7 @@ Use subcommands for headless/scripted operation.`,
 	root.AddCommand(buildPlansCmd())
 	root.AddCommand(buildConfigCmd())
 	root.AddCommand(buildVersionCmd())
+	root.AddCommand(buildTemplatesCmd())
 
 	return root
 }
@@ -635,6 +639,338 @@ func buildVersionCmd() *cobra.Command {
 	}
 }
 
+// ── templates command ─────────────────────────────────────────────────────────
+
+func buildTemplatesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "templates",
+		Short: "Manage intent templates",
+	}
+	cmd.AddCommand(buildTemplatesGenerateCmd())
+	cmd.AddCommand(buildTemplatesPendingCmd())
+	cmd.AddCommand(buildTemplatesApproveCmd())
+	cmd.AddCommand(buildTemplatesRejectCmd())
+	cmd.AddCommand(buildTemplatesStatsCmd())
+	cmd.AddCommand(buildTemplatesTuneCmd())
+	cmd.AddCommand(buildTemplatesRetireCmd())
+	cmd.AddCommand(buildTemplatesPromoteCmd())
+	return cmd
+}
+
+func buildTemplatesGenerateCmd() *cobra.Command {
+	var cfgPath string
+
+	return &cobra.Command{
+		Use:   "generate",
+		Short: "Generate templates from cached plans",
+		Long: `Analyze cached plans and extract reusable templates from clusters
+of similar intent→plan mappings. Generated templates are either auto-deployed
+(if autonomy_level >= 4) or saved to pending for review.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			cachePath := filepath.Join(dataDir, "cache", "plans.json")
+			pc := cache.New(cache.Config{Path: cachePath})
+
+			templatePath := findRepoTemplates()
+			tr, err := router.NewTemplateRegistry(templatePath)
+			if err != nil {
+				return fmt.Errorf("load templates: %w", err)
+			}
+
+			gc := router.GeneratorConfigFrom(cfg, dataDir)
+			gen := router.NewGenerator(gc, pc, tr)
+
+			templates, err := gen.Run()
+			if err != nil {
+				return fmt.Errorf("generate templates: %w", err)
+			}
+
+			if len(templates) == 0 {
+				fmt.Println("No templates generated. Need more similar cached plans.")
+				return nil
+			}
+
+			for _, t := range templates {
+				if gc.AutoApprove {
+					if err := gen.AutoDeploy(t); err != nil {
+						return fmt.Errorf("deploy template %s: %w", t.Name, err)
+					}
+					fmt.Printf("[DEPLOYED] %s — %d sources, confidence %.1f\n", t.Name, t.SourceCount, t.Confidence)
+				} else {
+					if err := gen.SavePending(t); err != nil {
+						return fmt.Errorf("save pending template %s: %w", t.Name, err)
+					}
+					fmt.Printf("[PENDING] %s — %d sources, confidence %.1f\n", t.Name, t.SourceCount, t.Confidence)
+				}
+				fmt.Printf("  Patterns: %s\n", strings.Join(t.Patterns, ", "))
+				fmt.Printf("  Intents:  %s\n", strings.Join(t.SourceIntents, ", "))
+			}
+
+			return nil
+		},
+	}
+}
+
+func buildTemplatesPendingCmd() *cobra.Command {
+	var cfgPath string
+
+	return &cobra.Command{
+		Use:   "pending",
+		Short: "List pending auto-generated templates",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			gc := router.GeneratorConfigFrom(cfg, dataDir)
+			tr, _ := router.NewTemplateRegistry("")
+			gen := router.NewGenerator(gc, nil, tr)
+
+			pending, err := gen.ListPending()
+			if err != nil {
+				return fmt.Errorf("list pending: %w", err)
+			}
+
+			if len(pending) == 0 {
+				fmt.Println("No pending templates.")
+				return nil
+			}
+
+			fmt.Printf("%-30s  %-8s  %-10s  %s\n", "NAME", "SOURCES", "CONFIDENCE", "GENERATED")
+			fmt.Println(strings.Repeat("─", 80))
+			for _, t := range pending {
+				fmt.Printf("%-30s  %-8d  %-10.1f  %s\n",
+					t.Name,
+					t.SourceCount,
+					t.Confidence,
+					t.GeneratedAt.Format("2006-01-02 15:04:05"),
+				)
+			}
+			fmt.Printf("\nPending file: %s\n", gc.PendingPath)
+			fmt.Println("Use 'hyperi templates approve <name>' to deploy.")
+			return nil
+		},
+	}
+}
+
+func buildTemplatesApproveCmd() *cobra.Command {
+	var cfgPath string
+
+	return &cobra.Command{
+		Use:   "approve <name>",
+		Short: "Approve and deploy a pending template",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			gc := router.GeneratorConfigFrom(cfg, dataDir)
+			tr, _ := router.NewTemplateRegistry("")
+			gen := router.NewGenerator(gc, nil, tr)
+
+			name := args[0]
+			if err := gen.Approve(name); err != nil {
+				return err
+			}
+
+			fmt.Printf("Template %q approved and deployed.\n", name)
+			return nil
+		},
+	}
+}
+
+func buildTemplatesRejectCmd() *cobra.Command {
+	var cfgPath string
+
+	return &cobra.Command{
+		Use:   "reject <name>",
+		Short: "Reject and delete a pending template",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			gc := router.GeneratorConfigFrom(cfg, dataDir)
+			tr, _ := router.NewTemplateRegistry("")
+			gen := router.NewGenerator(gc, nil, tr)
+
+			name := args[0]
+			if err := gen.Reject(name); err != nil {
+				return err
+			}
+
+			fmt.Printf("Template %q rejected and deleted.\n", name)
+			return nil
+		},
+	}
+}
+
+func buildTemplatesStatsCmd() *cobra.Command {
+	var cfgPath string
+
+	return &cobra.Command{
+		Use:   "stats",
+		Short: "Show generator metrics and template performance",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			metricsPath := filepath.Join(dataDir, "cache", "template_metrics.json")
+			retiredPath := filepath.Join(dataDir, "cache", "retired_templates.yaml")
+			gc := router.GeneratorConfigFrom(cfg, dataDir)
+			tr, _ := router.NewTemplateRegistry("")
+			gen := router.NewGeneratorWithMetrics(gc, nil, tr, metricsPath, retiredPath)
+
+			metrics := gen.GetGeneratorMetrics()
+			tmplMetrics := gen.GetAllTemplateMetrics()
+
+			fmt.Printf("Generator Metrics\n")
+			fmt.Printf("  Total templates:     %d\n", metrics.TotalTemplates)
+			fmt.Printf("  Active templates:    %d\n", metrics.ActiveTemplates)
+			fmt.Printf("  Retired templates:   %d\n", metrics.RetiredTemplates)
+			fmt.Printf("  Total hits:          %d\n", metrics.TotalHits)
+			fmt.Printf("  Hit rate:            %.4f\n", metrics.HitRate)
+			fmt.Printf("  False positive rate: %.4f\n", metrics.FalsePositiveRate)
+			fmt.Printf("  Pending templates:   %d\n", metrics.PendingCount)
+			fmt.Printf("  Min cluster size:    %d\n", gc.MinClusterSize)
+			fmt.Printf("  Min success rate:    %.2f\n", gc.MinSuccessRate)
+			if !metrics.LastRun.IsZero() {
+				fmt.Printf("  Last tuning run:     %s\n", metrics.LastRun.Format("2006-01-02 15:04:05"))
+			}
+
+			if len(tmplMetrics) > 0 {
+				fmt.Printf("\nTemplate Performance\n")
+				fmt.Printf("%-30s  %-8s  %-8s  %-8s  %-8s  %-10s  %s\n", "NAME", "HITS", "EXEC", "SUCCESS", "FAIL", "FP RATE", "STATUS")
+				fmt.Println(strings.Repeat("─", 90))
+				for _, tm := range tmplMetrics {
+					fpRate := 0.0
+					if tm.HitCount > 0 {
+						fpRate = float64(tm.FalsePositives) / float64(tm.HitCount)
+					}
+					fmt.Printf("%-30s  %-8d  %-8d  %-8d  %-8d  %-10.2f  %s\n",
+						tm.Name, tm.HitCount, tm.ExecCount, tm.SuccessCount, tm.FailCount, fpRate, tm.Status,
+					)
+				}
+			}
+
+			return nil
+		},
+	}
+}
+
+func buildTemplatesTuneCmd() *cobra.Command {
+	var cfgPath string
+
+	return &cobra.Command{
+		Use:   "tune",
+		Short: "Run self-tuning cycle manually",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			metricsPath := filepath.Join(dataDir, "cache", "template_metrics.json")
+			retiredPath := filepath.Join(dataDir, "cache", "retired_templates.yaml")
+			gc := router.GeneratorConfigFrom(cfg, dataDir)
+			tr, _ := router.NewTemplateRegistry("")
+			gen := router.NewGeneratorWithMetrics(gc, nil, tr, metricsPath, retiredPath)
+
+			if err := gen.SelfTune(); err != nil {
+				fmt.Printf("Self-tuning result: %v\n", err)
+				return nil
+			}
+
+			metrics := gen.GetGeneratorMetrics()
+			fmt.Printf("Self-tuning complete.\n")
+			fmt.Printf("  Min cluster size: %d\n", gc.MinClusterSize)
+			fmt.Printf("  Min success rate: %.2f\n", gc.MinSuccessRate)
+			fmt.Printf("  Active templates: %d\n", metrics.ActiveTemplates)
+
+			return nil
+		},
+	}
+}
+
+func buildTemplatesRetireCmd() *cobra.Command {
+	var cfgPath string
+
+	return &cobra.Command{
+		Use:   "retire <name>",
+		Short: "Manually retire a template",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			metricsPath := filepath.Join(dataDir, "cache", "template_metrics.json")
+			retiredPath := filepath.Join(dataDir, "cache", "retired_templates.yaml")
+			gc := router.GeneratorConfigFrom(cfg, dataDir)
+			tr, _ := router.NewTemplateRegistry("")
+			gen := router.NewGeneratorWithMetrics(gc, nil, tr, metricsPath, retiredPath)
+
+			name := args[0]
+			if err := gen.RetireTemplate(name); err != nil {
+				return err
+			}
+
+			fmt.Printf("Template %q retired.\n", name)
+			return nil
+		},
+	}
+}
+
+func buildTemplatesPromoteCmd() *cobra.Command {
+	var cfgPath string
+
+	return &cobra.Command{
+		Use:   "promote <name>",
+		Short: "Manually promote a template to trusted",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return err
+			}
+
+			dataDir := resolveDataDir()
+			metricsPath := filepath.Join(dataDir, "cache", "template_metrics.json")
+			retiredPath := filepath.Join(dataDir, "cache", "retired_templates.yaml")
+			gc := router.GeneratorConfigFrom(cfg, dataDir)
+			tr, _ := router.NewTemplateRegistry("")
+			gen := router.NewGeneratorWithMetrics(gc, nil, tr, metricsPath, retiredPath)
+
+			name := args[0]
+			if err := gen.PromoteTemplate(name); err != nil {
+				return err
+			}
+
+			fmt.Printf("Template %q promoted to trusted.\n", name)
+			return nil
+		},
+	}
+}
+
 // ── Headless pipeline runner ──────────────────────────────────────────────────
 
 // runHeadless runs the full pipeline without the TUI. Used by
@@ -647,7 +983,6 @@ func runHeadless(cfg *config.Config, intent string, execute bool) error {
 	defer infra.sched.Stop()
 	defer infra.eventBus.Close()
 
-	// Subscribe audit consumer
 	auditCh := infra.eventBus.Subscribe()
 	go bus.DrainToAudit(auditCh, infra.auditLog.Log)
 
@@ -655,7 +990,11 @@ func runHeadless(cfg *config.Config, intent string, execute bool) error {
 		return fmt.Errorf("intent is required in --no-tui mode")
 	}
 
-	runner := shell.NewPipelineRunner(shell.RunnerConfig{
+	if !execute {
+		cfg.AutonomyLevel = config.AutonomyObserve
+	}
+
+	pipelineRunner := shell.NewPipelineRunner(shell.RunnerConfig{
 		APIKey:        infra.apiKey,
 		AutonomyLevel: cfg.AutonomyLevel,
 		ExecutorType:  "local",
@@ -670,12 +1009,21 @@ func runHeadless(cfg *config.Config, intent string, execute bool) error {
 		WorkspaceDir:  infra.workDir,
 	})
 
-	if !execute {
-		// Autonomy 0 = observe only — present plan, don't execute
-		cfg.AutonomyLevel = config.AutonomyObserve
-	}
+	templatePath := findRepoTemplates()
+	ir := router.New(router.Config{
+		CachePath:     infra.dataPathFn("cache/plans.json"),
+		TemplatePath:  templatePath,
+		StatsPath:     infra.dataPathFn("cache/stats.json"),
+		Fallback:      func(intent, _ string) error { return pipelineRunner(intent, "") },
+		Registry:      infra.registry,
+		Validator:     infra.validator,
+		EventBus:      infra.eventBus,
+		SessionID:     "headless",
+		AutonomyLevel: cfg.AutonomyLevel,
+		WorkspaceDir:  infra.workDir,
+	})
 
-	return runner(intent, "")
+	return ir.Route(context.Background(), intent)
 }
 
 // launchShellWithIntent opens the TUI shell with an intent pre-queued.
@@ -729,22 +1077,49 @@ func defaultConfigPath() string {
 // Returns "" if not found.
 func findRepoAllowlist() string {
 	candidates := []string{
-		// Relative to the repo root when running from the checkout
 		"config/allowlist.yaml",
-		// Installed alongside the binary in /opt/hyperios
 		"/opt/hyperios/config/allowlist.yaml",
-		// Executable-relative: walk up from the binary to find a config/ dir
 		func() string {
 			exe, err := os.Executable()
 			if err != nil {
 				return ""
 			}
-			// Resolve symlinks (e.g. /usr/local/bin/hyperi -> actual path)
 			exe, _ = filepath.EvalSymlinks(exe)
-			// Walk up at most 3 levels looking for config/allowlist.yaml
 			dir := filepath.Dir(exe)
 			for i := 0; i < 3; i++ {
 				candidate := filepath.Join(dir, "config", "allowlist.yaml")
+				if _, err := os.Stat(candidate); err == nil {
+					return candidate
+				}
+				dir = filepath.Dir(dir)
+			}
+			return ""
+		}(),
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+func findRepoTemplates() string {
+	candidates := []string{
+		"config/templates.yaml",
+		"/opt/hyperios/config/templates.yaml",
+		func() string {
+			exe, err := os.Executable()
+			if err != nil {
+				return ""
+			}
+			exe, _ = filepath.EvalSymlinks(exe)
+			dir := filepath.Dir(exe)
+			for i := 0; i < 3; i++ {
+				candidate := filepath.Join(dir, "config", "templates.yaml")
 				if _, err := os.Stat(candidate); err == nil {
 					return candidate
 				}

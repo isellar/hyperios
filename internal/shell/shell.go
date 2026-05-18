@@ -10,6 +10,7 @@
 package shell
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	cfg "github.com/isellar/hyperios/internal/config"
 	"github.com/isellar/hyperios/internal/manifest"
 	"github.com/isellar/hyperios/internal/plan"
+	"github.com/isellar/hyperios/internal/router"
 	"github.com/isellar/hyperios/internal/session"
 )
 
@@ -98,7 +100,7 @@ func (s *Shell) Run() error {
 	}
 
 	// Build pipeline runner
-	runner := NewPipelineRunner(RunnerConfig{
+	pipelineRunner := NewPipelineRunner(RunnerConfig{
 		APIKey:        s.apiKey,
 		AutonomyLevel: s.config.AutonomyLevel,
 		ExecutorType:  "local",
@@ -112,6 +114,9 @@ func (s *Shell) Run() error {
 		DataPathFn:    s.dataPathFn,
 		WorkspaceDir:  s.workDir,
 	})
+
+	// Wrap with intent router for fast-path execution
+	runner := wrapWithRouter(pipelineRunner, s)
 
 	// Build model
 	vc := VoiceConfig{
@@ -238,3 +243,45 @@ func (s *Shell) startupNotifications() []string {
 
 	return notes
 }
+
+// ── Intent Router integration ─────────────────────────────────────────────────
+
+// wrapWithRouter creates a PipelineRunner that uses the IntentRouter for fast-path execution.
+func wrapWithRouter(fallback PipelineRunner, s *Shell) PipelineRunner {
+	templatePath := findTemplates(s.dataPathFn)
+
+	ir := router.New(router.Config{
+		CachePath:     s.dataPathFn("cache/plans.json"),
+		TemplatePath:  templatePath,
+		StatsPath:     s.dataPathFn("cache/stats.json"),
+		Fallback:      func(intent, _ string) error { return fallback(intent, "") },
+		Registry:      s.registry,
+		Validator:     s.validator,
+		EventBus:      s.eventBus,
+		SessionID:     "",
+		AutonomyLevel: s.config.AutonomyLevel,
+		WorkspaceDir:  s.workDir,
+	})
+
+	return func(intent, sessionID string) error {
+		if strings.HasPrefix(intent, resumePrefix) {
+			return fallback(intent, sessionID)
+		}
+		return ir.Route(context.Background(), intent)
+	}
+}
+
+func findTemplates(dataPathFn func(string) string) string {
+	candidates := []string{
+		"config/templates.yaml",
+		"/opt/hyperios/config/templates.yaml",
+		dataPathFn("templates.yaml"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
