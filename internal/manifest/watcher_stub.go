@@ -2,7 +2,7 @@
 
 package manifest
 
-import "github.com/isellar/hyperios/internal/bus"
+import "github.com/isellar/hyperios/internal/events"
 
 // Watcher is a no-op stub on non-Linux platforms.
 // HyperiOS targets Linux only; this stub exists to keep the package
@@ -10,7 +10,7 @@ import "github.com/isellar/hyperios/internal/bus"
 type Watcher struct{}
 
 // NewWatcher returns a no-op watcher on non-Linux platforms.
-func NewWatcher(store *Store, eventBus *bus.Bus, watchPaths []string) (*Watcher, error) {
+func NewWatcher(store *Store, notifier *events.Notifier, watchPaths []string) (*Watcher, error) {
 	return &Watcher{}, nil
 }
 

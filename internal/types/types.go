@@ -1,5 +1,7 @@
 package types
 
+import "time"
+
 // GoalGraph is the structured output of the Intent Agent.
 type GoalGraph struct {
 	Intent  string `json:"intent"`
@@ -7,11 +9,43 @@ type GoalGraph struct {
 	Goals   []Goal `json:"goals"`
 }
 
+// GoalState represents the lifecycle state of a Goal.
+type GoalState string
+
+const (
+	GoalStateRefining  GoalState = "refining"
+	GoalStateActive    GoalState = "active"
+	GoalStateDone      GoalState = "done"
+	GoalStateBlocked   GoalState = "blocked"
+	GoalStateCancelled GoalState = "cancelled"
+)
+
 // Goal is a single node in the goal graph.
 type Goal struct {
-	ID          string   `json:"id"`
-	Description string   `json:"description"`
-	DependsOn   []string `json:"depends_on"`
+	ID          string    `json:"id"`
+	State       GoalState `json:"state"`
+	Description string    `json:"description"`
+	SubGoals    []string  `json:"sub_goals,omitempty"`
+	DependsOn   []string  `json:"depends_on,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// Directive is a behavioral constraint for the agent.
+// Immutable directives are hardcoded safety rules; mutable ones are user-configurable.
+type Directive struct {
+	ID          string `json:"id"`
+	Priority    int    `json:"priority"`
+	Description string `json:"description"`
+	Immutable   bool   `json:"immutable"`
+}
+
+// ToolAuthorization records a user's authorization for a specific tool or capability.
+type ToolAuthorization struct {
+	ToolID       string    `json:"tool_id"`
+	Scope        string    `json:"scope"` // "always", "session", "request"
+	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+	AuthorizedBy string    `json:"authorized_by"`
 }
 
 // Capability describes what OS-level permission a step requires.

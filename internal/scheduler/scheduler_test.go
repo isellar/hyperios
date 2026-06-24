@@ -5,12 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/events"
 )
 
 func TestScheduler_RegisterAndRun(t *testing.T) {
-	b := bus.New(16)
-	s := New(b)
+	n := events.NewNotifier(16)
+	s := New(n)
 	s.Start()
 	defer s.Stop()
 
@@ -38,9 +38,9 @@ func TestScheduler_RegisterAndRun(t *testing.T) {
 }
 
 func TestScheduler_PublishesEvent(t *testing.T) {
-	b := bus.New(16)
-	ch := b.Subscribe()
-	s := New(b)
+	n := events.NewNotifier(16)
+	ch := n.Events()
+	s := New(n)
 	s.Start()
 	defer s.Stop()
 
@@ -48,7 +48,7 @@ func TestScheduler_PublishesEvent(t *testing.T) {
 
 	select {
 	case e := <-ch:
-		if e.Kind != bus.EventScheduledFired {
+		if e.Kind != events.EventScheduledFired {
 			t.Errorf("expected EventScheduledFired, got %q", e.Kind)
 		}
 		if e.Payload != "event-test" {

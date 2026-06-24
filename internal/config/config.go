@@ -72,6 +72,38 @@ type Config struct {
 
 	// GeneratorConfig controls template generation behavior.
 	Generator GeneratorConfig `json:"generator,omitempty"`
+
+	// DirectivesImmutablePath is the path to the immutable safety directives YAML file.
+	// Default: /etc/hyperi/directives-immutable.yaml
+	DirectivesImmutablePath string `json:"directives_immutable_path,omitempty"`
+
+	// DirectivesMutablePath is the path to the user-modifiable directives YAML file.
+	// Default: /var/lib/hyperi/directives-mutable.yaml
+	DirectivesMutablePath string `json:"directives_mutable_path,omitempty"`
+
+	// GoalStoragePath is the path to the goal state storage file.
+	// Default: /var/lib/hyperi/goals.json
+	GoalStoragePath string `json:"goal_storage_path,omitempty"`
+
+	// MemoryStoragePath is the path to the agent memory storage directory.
+	// Default: /var/lib/hyperi/memory
+	MemoryStoragePath string `json:"memory_storage_path,omitempty"`
+
+	// ToolAuthStoragePath is the path to the tool authorization persistence file.
+	// Default: /var/lib/hyperi/tool_auth.json
+	ToolAuthStoragePath string `json:"tool_auth_storage_path,omitempty"`
+
+	// MaxAgentSpawnLimit is the maximum number of concurrent sub-agents allowed.
+	// Default: 5
+	MaxAgentSpawnLimit int `json:"max_agent_spawn_limit,omitempty"`
+
+	// LLMProvider is the model provider to use (e.g. "anthropic", "openai").
+	// Default: "anthropic"
+	LLMProvider string `json:"llm_provider,omitempty"`
+
+	// LLMModel is the model identifier (e.g. "claude-sonnet-4-20250514").
+	// Default: "" (uses provider default)
+	LLMModel string `json:"llm_model,omitempty"`
 }
 
 // GeneratorConfig controls the self-improvement template generator.
@@ -111,6 +143,18 @@ func Defaults() *Config {
 			MinSuccessRate: 0.8,
 			AutoApprove:    false,
 		},
+		// Directive paths
+		DirectivesImmutablePath: "/etc/hyperi/directives-immutable.yaml",
+		DirectivesMutablePath:   "/var/lib/hyperi/directives-mutable.yaml",
+		// Storage paths
+		GoalStoragePath:    "/var/lib/hyperi/goals.json",
+		MemoryStoragePath:  "/var/lib/hyperi/memory",
+		ToolAuthStoragePath: "/var/lib/hyperi/tool_auth.json",
+		// Agent limits
+		MaxAgentSpawnLimit: 5,
+		// LLM provider
+		LLMProvider: "anthropic",
+		LLMModel:    "",
 	}
 }
 

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/events"
 	"github.com/isellar/hyperios/internal/capability"
 	"github.com/isellar/hyperios/internal/types"
 )
@@ -17,7 +17,7 @@ type ContainerExecutor struct {
 	enforcer  *capability.Enforcer
 	workspace string
 	image     string
-	eventBus  *bus.Bus
+	notifier  *events.Notifier
 	sessionID string
 }
 
@@ -33,10 +33,10 @@ func NewContainer(registry *capability.Registry, workspace string, image string)
 	}
 }
 
-// NewContainerWithBus creates a ContainerExecutor with event bus support.
-func NewContainerWithBus(registry *capability.Registry, workspace, image string, b *bus.Bus, sessionID string) *ContainerExecutor {
+// NewContainerWithNotifier creates a ContainerExecutor with event notifier support.
+func NewContainerWithNotifier(registry *capability.Registry, workspace, image string, n *events.Notifier, sessionID string) *ContainerExecutor {
 	e := NewContainer(registry, workspace, image)
-	e.eventBus = b
+	e.notifier = n
 	e.sessionID = sessionID
 	return e
 }
@@ -49,11 +49,11 @@ func (e *ContainerExecutor) Validate(step types.ActionStep) error {
 	return e.enforcer.Validate(step)
 }
 
-func (e *ContainerExecutor) publish(kind bus.EventKind, stepID string, payload any) {
-	if e.eventBus == nil {
+func (e *ContainerExecutor) publish(kind events.EventKind, stepID string, payload any) {
+	if e.notifier == nil {
 		return
 	}
-	e.eventBus.PublishStep(kind, e.sessionID, stepID, payload)
+	e.notifier.PublishStep(kind, e.sessionID, stepID, payload)
 }
 
 func (e *ContainerExecutor) Execute(ctx context.Context, step types.ActionStep) (*types.ExecutionResult, error) {
@@ -68,7 +68,7 @@ func (e *ContainerExecutor) Execute(ctx context.Context, step types.ActionStep) 
 		}, err
 	}
 
-	e.publish(bus.EventStepStarted, step.ID, step.Description)
+	e.publish(events.EventStepStarted, step.ID, step.Description)
 
 	output, execErr := e.executeInContainer(step)
 
@@ -84,20 +84,20 @@ func (e *ContainerExecutor) Execute(ctx context.Context, step types.ActionStep) 
 		switch step.OnFailure {
 		case "skip":
 			result.Error = fmt.Sprintf("skipped: %s", execErr)
-			e.publish(bus.EventStepSkipped, step.ID, result.Error)
+			e.publish(events.EventStepSkipped, step.ID, result.Error)
 			return result, ErrStepSkipped
 		case "replan":
-			e.publish(bus.EventStepFailed, step.ID, result.Error)
+			e.publish(events.EventStepFailed, step.ID, result.Error)
 			return result, ErrReplan
 		default:
-			e.publish(bus.EventStepFailed, step.ID, result.Error)
+			e.publish(events.EventStepFailed, step.ID, result.Error)
 			return result, execErr
 		}
 	}
 
 	result.Success = true
 	result.Output = output
-	e.publish(bus.EventStepCompleted, step.ID, result)
+	e.publish(events.EventStepCompleted, step.ID, result)
 	return result, nil
 }
 

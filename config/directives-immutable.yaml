@@ -1,0 +1,21 @@
+directives:
+  - id: "safety-no-harm"
+    priority: 1
+    description: "Do not harm the user"
+    immutable: true
+  - id: "safety-no-delete"
+    priority: 2
+    description: "Do not delete user data without explicit permission"
+    immutable: true
+  - id: "safety-no-compromise"
+    priority: 3
+    description: "Do not execute commands that could compromise system security"
+    immutable: true
+  - id: "safety-no-secrets"
+    priority: 4
+    description: "Do not expose secrets, keys, or credentials in output"
+    immutable: true
+  - id: "safety-no-network-exfil"
+    priority: 5
+    description: "Do not send user data to external services without authorization"
+    immutable: true

@@ -13,6 +13,8 @@ type Module interface {
 	Report(ctx context.Context, window time.Duration) (ModuleReport, error)
 	Tune(ctx context.Context, change TuningChange) error
 	Health() ModuleHealth
+	// Capabilities returns the list of capability types this module requires.
+	Capabilities() []string
 }
 
 // ModuleReport contains metrics and issues for a module within a time window.

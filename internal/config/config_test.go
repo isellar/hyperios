@@ -174,3 +174,78 @@ func TestAutonomyLevelText(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaults_NewFields(t *testing.T) {
+	cfg := Defaults()
+
+	if cfg.DirectivesImmutablePath != "/etc/hyperi/directives-immutable.yaml" {
+		t.Errorf("expected DirectivesImmutablePath '/etc/hyperi/directives-immutable.yaml', got %q", cfg.DirectivesImmutablePath)
+	}
+	if cfg.DirectivesMutablePath != "/var/lib/hyperi/directives-mutable.yaml" {
+		t.Errorf("expected DirectivesMutablePath '/var/lib/hyperi/directives-mutable.yaml', got %q", cfg.DirectivesMutablePath)
+	}
+	if cfg.GoalStoragePath != "/var/lib/hyperi/goals.json" {
+		t.Errorf("expected GoalStoragePath '/var/lib/hyperi/goals.json', got %q", cfg.GoalStoragePath)
+	}
+	if cfg.MemoryStoragePath != "/var/lib/hyperi/memory" {
+		t.Errorf("expected MemoryStoragePath '/var/lib/hyperi/memory', got %q", cfg.MemoryStoragePath)
+	}
+	if cfg.ToolAuthStoragePath != "/var/lib/hyperi/tool_auth.json" {
+		t.Errorf("expected ToolAuthStoragePath '/var/lib/hyperi/tool_auth.json', got %q", cfg.ToolAuthStoragePath)
+	}
+	if cfg.MaxAgentSpawnLimit != 5 {
+		t.Errorf("expected MaxAgentSpawnLimit 5, got %d", cfg.MaxAgentSpawnLimit)
+	}
+	if cfg.LLMProvider != "anthropic" {
+		t.Errorf("expected LLMProvider 'anthropic', got %q", cfg.LLMProvider)
+	}
+}
+
+func TestSaveLoad_RoundTrip_NewFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	original := Defaults()
+	original.DirectivesImmutablePath = "/custom/immutable.yaml"
+	original.DirectivesMutablePath = "/custom/mutable.yaml"
+	original.GoalStoragePath = "/custom/goals.json"
+	original.MemoryStoragePath = "/custom/memory"
+	original.ToolAuthStoragePath = "/custom/tool_auth.json"
+	original.MaxAgentSpawnLimit = 10
+	original.LLMProvider = "openai"
+	original.LLMModel = "gpt-4"
+
+	if err := Save(path, original); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if loaded.DirectivesImmutablePath != original.DirectivesImmutablePath {
+		t.Errorf("DirectivesImmutablePath: expected %q, got %q", original.DirectivesImmutablePath, loaded.DirectivesImmutablePath)
+	}
+	if loaded.DirectivesMutablePath != original.DirectivesMutablePath {
+		t.Errorf("DirectivesMutablePath: expected %q, got %q", original.DirectivesMutablePath, loaded.DirectivesMutablePath)
+	}
+	if loaded.GoalStoragePath != original.GoalStoragePath {
+		t.Errorf("GoalStoragePath: expected %q, got %q", original.GoalStoragePath, loaded.GoalStoragePath)
+	}
+	if loaded.MemoryStoragePath != original.MemoryStoragePath {
+		t.Errorf("MemoryStoragePath: expected %q, got %q", original.MemoryStoragePath, loaded.MemoryStoragePath)
+	}
+	if loaded.ToolAuthStoragePath != original.ToolAuthStoragePath {
+		t.Errorf("ToolAuthStoragePath: expected %q, got %q", original.ToolAuthStoragePath, loaded.ToolAuthStoragePath)
+	}
+	if loaded.MaxAgentSpawnLimit != original.MaxAgentSpawnLimit {
+		t.Errorf("MaxAgentSpawnLimit: expected %d, got %d", original.MaxAgentSpawnLimit, loaded.MaxAgentSpawnLimit)
+	}
+	if loaded.LLMProvider != original.LLMProvider {
+		t.Errorf("LLMProvider: expected %q, got %q", original.LLMProvider, loaded.LLMProvider)
+	}
+	if loaded.LLMModel != original.LLMModel {
+		t.Errorf("LLMModel: expected %q, got %q", original.LLMModel, loaded.LLMModel)
+	}
+}

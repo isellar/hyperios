@@ -12,15 +12,15 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/events"
 	"github.com/isellar/hyperios/internal/types"
 	"github.com/isellar/hyperios/internal/voice"
 )
 
 // ── Message types ─────────────────────────────────────────────────────────────
 
-// busEventMsg wraps a bus.Event for delivery to the bubbletea Update loop.
-type busEventMsg struct{ event bus.Event }
+// busEventMsg wraps an events.Event for delivery to the bubbletea Update loop.
+type busEventMsg struct{ event events.Event }
 
 // pipelineStartMsg signals that a pipeline run has started.
 type pipelineStartMsg struct{ intent string }
@@ -93,9 +93,9 @@ type Model struct {
 	approval    *approvalRequestMsg
 	approvalEnd time.Time
 
-	// Event bus
-	eventBus *bus.Bus
-	busCh    <-chan bus.Event
+	// Event notifier
+	notifier *events.Notifier
+	eventCh  <-chan events.Event
 
 	// Pipeline runner — called when user submits input
 	runner PipelineRunner
@@ -141,7 +141,7 @@ type AutonomyConfig struct {
 }
 
 // New creates a new TUI Model.
-func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, workspaceDir string, vc VoiceConfig, ac AutonomyConfig) Model {
+func New(notifier *events.Notifier, runner PipelineRunner, notifications []string, workspaceDir string, vc VoiceConfig, ac AutonomyConfig) Model {
 	// Text input
 	ti := textinput.New()
 	ti.Placeholder = "what do you want to do?"
@@ -161,7 +161,7 @@ func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, works
 	m := Model{
 		input:          ti,
 		viewport:       vp,
-		eventBus:       eventBus,
+		notifier:       notifier,
 		runner:         runner,
 		notifications:  notifications,
 		workspaceDir:   workspaceDir,
@@ -174,9 +174,9 @@ func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, works
 		autonomySetFn:  ac.SetFn,
 	}
 
-	// Subscribe to event bus
-	if eventBus != nil {
-		m.busCh = eventBus.Subscribe()
+	// Subscribe to event notifier
+	if notifier != nil {
+		m.eventCh = notifier.Events()
 	}
 
 	return m
@@ -191,8 +191,8 @@ func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		textinput.Blink,
 	}
-	if m.busCh != nil {
-		cmds = append(cmds, waitForBusEvent(m.busCh))
+	if m.eventCh != nil {
+		cmds = append(cmds, waitForEvent(m.eventCh))
 	}
 	// If an initial intent was passed via environment (from `hyperi session start "..."`),
 	// inject it as the first command after the TUI is ready.
@@ -296,8 +296,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case busEventMsg:
 		m.handleBusEvent(msg.event)
 		// Keep listening
-		if m.busCh != nil {
-			cmds = append(cmds, waitForBusEvent(m.busCh))
+		if m.eventCh != nil {
+			cmds = append(cmds, waitForEvent(m.eventCh))
 		}
 
 	case approvalRequestMsg:
@@ -579,15 +579,15 @@ func (m *Model) handleInput() tea.Cmd {
 	)
 }
 
-func (m *Model) handleBusEvent(e bus.Event) {
+func (m *Model) handleBusEvent(e events.Event) {
 	switch e.Kind {
-	case bus.EventStepStarted:
+	case events.EventStepStarted:
 		m.appendLine(outputLine{
 			text:  fmt.Sprintf("  → %s", e.StepID),
 			style: styleStepStarted,
 		})
 
-	case bus.EventStepCompleted:
+	case events.EventStepCompleted:
 		m.appendLine(outputLine{
 			text:  fmt.Sprintf("  ✓ %s", e.StepID),
 			style: styleStepOk,
@@ -605,7 +605,7 @@ func (m *Model) handleBusEvent(e bus.Event) {
 			}
 		}
 
-	case bus.EventStepFailed:
+	case events.EventStepFailed:
 		m.appendLine(outputLine{
 			text:  fmt.Sprintf("  ✗ %s failed", e.StepID),
 			style: styleStepFail,
@@ -617,13 +617,13 @@ func (m *Model) handleBusEvent(e bus.Event) {
 			})
 		}
 
-	case bus.EventStepSkipped:
+	case events.EventStepSkipped:
 		m.appendLine(outputLine{
 			text:  fmt.Sprintf("  - %s (skipped)", e.StepID),
 			style: styleStepSkip,
 		})
 
-	case bus.EventKind("plan:response"):
+	case events.EventKind("plan:response"):
 		if text, ok := e.Payload.(string); ok && text != "" {
 			m.appendBlank()
 			m.appendLine(outputLine{text: "── Answer ───────────────────────────────", style: stylePlanHeading})
@@ -633,13 +633,13 @@ func (m *Model) handleBusEvent(e bus.Event) {
 			m.appendBlank()
 		}
 
-	case bus.EventPlanCompleted:
+	case events.EventPlanCompleted:
 		m.appendLine(outputLine{
 			text:  "✓ Done",
 			style: styleStepOk,
 		})
 
-	case bus.EventPlanFailed:
+	case events.EventPlanFailed:
 		m.appendLine(outputLine{
 			text:  "✗ Plan failed",
 			style: styleStepFail,
@@ -648,8 +648,8 @@ func (m *Model) handleBusEvent(e bus.Event) {
 			m.appendLine(outputLine{text: "  " + msg, style: styleError})
 		}
 
-	case bus.EventApprovalNeeded:
-		if ap, ok := e.Payload.(*bus.ApprovalPayload); ok {
+	case events.EventApprovalNeeded:
+		if ap, ok := e.Payload.(*events.ApprovalPayload); ok {
 			timeout := time.Duration(ap.TimeoutSeconds) * time.Second
 			if timeout == 0 {
 				timeout = 5 * time.Minute
@@ -665,7 +665,7 @@ func (m *Model) handleBusEvent(e bus.Event) {
 			m.approvalEnd = time.Now().Add(timeout)
 		}
 
-	case bus.EventKind("plan:verdicts"):
+	case events.EventKind("plan:verdicts"):
 		if pv, ok := e.Payload.(*planVerdicts); ok && pv != nil {
 			if m.planShown {
 				// Re-plan: show a compact one-liner instead of re-printing the full plan
@@ -699,7 +699,7 @@ func (m *Model) handleBusEvent(e bus.Event) {
 			m.appendBlank()
 		}
 
-	case bus.EventScheduledFired:
+	case events.EventScheduledFired:
 		if name, ok := e.Payload.(string); ok {
 			m.appendLine(outputLine{
 				text:  fmt.Sprintf("  ⏰ Scheduled task fired: %s", name),
@@ -707,10 +707,10 @@ func (m *Model) handleBusEvent(e bus.Event) {
 			})
 		}
 
-	case bus.EventManifestUpdated:
+	case events.EventManifestUpdated:
 		// Silent — don't clutter output with manifest updates
 
-	case bus.EventAlertTriggered:
+	case events.EventAlertTriggered:
 		if msg, ok := e.Payload.(string); ok {
 			m.appendLine(outputLine{
 				text:  fmt.Sprintf("  ⚠  Alert: %s", msg),
@@ -854,8 +854,8 @@ func (m *Model) refreshViewport() {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
-// waitForBusEvent returns a tea.Cmd that blocks until the next bus event.
-func waitForBusEvent(ch <-chan bus.Event) tea.Cmd {
+// waitForEvent returns a tea.Cmd that blocks until the next event.
+func waitForEvent(ch <-chan events.Event) tea.Cmd {
 	return func() tea.Msg {
 		e, ok := <-ch
 		if !ok {

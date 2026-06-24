@@ -10,11 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/isellar/hyperios/internal/arbiter"
-	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/governor"
+	"github.com/isellar/hyperios/internal/events"
 	"github.com/isellar/hyperios/internal/cache"
-	"github.com/isellar/hyperios/internal/capability"
-	"github.com/isellar/hyperios/internal/executor"
+	"github.com/isellar/hyperios/internal/governor/capability"
+	"github.com/isellar/hyperios/internal/governor/executor"
 	"github.com/isellar/hyperios/internal/types"
 )
 
@@ -29,7 +29,7 @@ type Config struct {
 	Fallback     PipelineRunner
 	Registry     *capability.Registry
 	Validator    *capability.CommandValidator
-	EventBus     *bus.Bus
+	Notifier     *events.Notifier
 	SessionID    string
 	AutonomyLevel int
 	WorkspaceDir string
@@ -188,7 +188,7 @@ func (r *IntentRouter) executeTrusted(ctx context.Context, intent string) error 
 
 func (r *IntentRouter) runArbiter(plan *types.ActionPlan) []types.ArbiterVerdict {
 	emptyReport := &types.RiskReport{}
-	policyArbiter := arbiter.NewWithLevel(r.cfg.AutonomyLevel)
+	policyArbiter := governor.NewArbiterWithLevel(r.cfg.AutonomyLevel)
 	return policyArbiter.Decide(plan, emptyReport)
 }
 
@@ -201,7 +201,7 @@ func (r *IntentRouter) executePlan(ctx context.Context, plan *types.ActionPlan, 
 		Registry:     r.cfg.Registry,
 		Workspace:    r.cfg.WorkspaceDir,
 		ExecutorType: types.ExecutorLocal,
-		Bus:          r.cfg.EventBus,
+		Notifier:     r.cfg.Notifier,
 		SessionID:    r.cfg.SessionID,
 	}
 	execInstance := executor.New(execCfg)

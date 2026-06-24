@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
@@ -49,18 +50,90 @@ func (e *MalformedResponseError) Error() string {
 
 // Client wraps the Anthropic SDK for simple prompt→JSON calls.
 type Client struct {
-	inner *anthropic.Client
+	inner   *anthropic.Client
+	provider string
+	model    string
+
+	mu          sync.Mutex
+	totalInput  int64
+	totalOutput int64
+	totalCost   float64
+}
+
+// TokenUsage returns the cumulative token usage for this client.
+type TokenUsage struct {
+	InputTokens  int64
+	OutputTokens int64
+	TotalTokens  int64
+	EstimatedCost float64
 }
 
 // NewClient creates an Anthropic client. API key is read from ANTHROPIC_API_KEY
 // env var by the SDK automatically; pass an explicit key to override.
 func NewClient(apiKey string) *Client {
+	return NewClientWithConfig(apiKey, "anthropic", "")
+}
+
+// NewClientWithConfig creates a client with explicit provider and model settings.
+// Provider is currently informational; only "anthropic" is supported.
+// Model overrides the default model if non-empty.
+func NewClientWithConfig(apiKey, provider, model string) *Client {
 	opts := []option.RequestOption{}
 	if apiKey != "" {
 		opts = append(opts, option.WithAPIKey(apiKey))
 	}
 	c := anthropic.NewClient(opts...)
-	return &Client{inner: &c}
+	if provider == "" {
+		provider = "anthropic"
+	}
+	return &Client{
+		inner:    &c,
+		provider: provider,
+		model:    model,
+	}
+}
+
+// Usage returns the cumulative token usage and estimated cost.
+func (c *Client) Usage() TokenUsage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return TokenUsage{
+		InputTokens:   c.totalInput,
+		OutputTokens:  c.totalOutput,
+		TotalTokens:   c.totalInput + c.totalOutput,
+		EstimatedCost: c.totalCost,
+	}
+}
+
+// ResetUsage clears the cumulative token and cost counters.
+func (c *Client) ResetUsage() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.totalInput = 0
+	c.totalOutput = 0
+	c.totalCost = 0
+}
+
+func (c *Client) trackUsage(inputTokens, outputTokens int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.totalInput += inputTokens
+	c.totalOutput += outputTokens
+	c.totalCost += estimateCost(c.model, inputTokens, outputTokens)
+}
+
+func (c *Client) resolveModel() string {
+	if c.model != "" {
+		return c.model
+	}
+	return Model
+}
+
+// estimateCost returns a rough USD cost estimate based on model pricing tiers.
+func estimateCost(model string, input, output int64) float64 {
+	inputPricePerM := 3.0
+	outputPricePerM := 15.0
+	return (float64(input)/1_000_000)*inputPricePerM + (float64(output)/1_000_000)*outputPricePerM
 }
 
 // Complete sends a system + user prompt and returns the raw text response.
@@ -71,7 +144,7 @@ func NewClient(apiKey string) *Client {
 //   - MalformedResponseError: caller should retry up to 2 times; if still malformed, halt
 func (c *Client) Complete(ctx context.Context, system, user string) (string, error) {
 	msg, err := c.inner.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     Model,
+		Model:     anthropic.Model(c.resolveModel()),
 		MaxTokens: 4096,
 		System: []anthropic.TextBlockParam{
 			{Text: system},
@@ -86,6 +159,9 @@ func (c *Client) Complete(ctx context.Context, system, user string) (string, err
 	if len(msg.Content) == 0 {
 		return "", &NetworkError{Cause: fmt.Errorf("empty response from model")}
 	}
+
+	c.trackUsage(msg.Usage.InputTokens, msg.Usage.OutputTokens)
+
 	var sb strings.Builder
 	for _, block := range msg.Content {
 		if block.Type == "text" {

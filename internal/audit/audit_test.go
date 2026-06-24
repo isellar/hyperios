@@ -115,3 +115,127 @@ func TestLogger_Log_Appends(t *testing.T) {
 		t.Errorf("expected 2 lines, got %d", lines)
 	}
 }
+
+func TestLogger_LogGoalTransition(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := NewLogger(path)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+
+	gt := GoalTransition{
+		GoalID:    "goal-1",
+		FromState: "refining",
+		ToState:   "active",
+		Reason:    "user confirmed",
+	}
+	if err := logger.LogGoalTransition("session-1", gt); err != nil {
+		t.Fatalf("LogGoalTransition failed: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	var entry Entry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry.Stage != "goal:transition" {
+		t.Errorf("expected stage 'goal:transition', got %q", entry.Stage)
+	}
+}
+
+func TestLogger_LogToolAuthorization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := NewLogger(path)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+
+	ta := ToolAuthEvent{
+		ToolID:       "execute:shell",
+		Scope:        "session",
+		AuthorizedBy: "user",
+		Approved:     true,
+	}
+	if err := logger.LogToolAuthorization("session-1", ta); err != nil {
+		t.Fatalf("LogToolAuthorization failed: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	var entry Entry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry.Stage != "tool:authorization" {
+		t.Errorf("expected stage 'tool:authorization', got %q", entry.Stage)
+	}
+}
+
+func TestLogger_LogAgentSpawn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := NewLogger(path)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+
+	as := AgentSpawnEvent{
+		AgentType:  "planner",
+		ParentID:   "agent-0",
+		Reason:     "complex task",
+		SpawnCount: 1,
+	}
+	if err := logger.LogAgentSpawn("session-1", as); err != nil {
+		t.Fatalf("LogAgentSpawn failed: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	var entry Entry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry.Stage != "agent:spawn" {
+		t.Errorf("expected stage 'agent:spawn', got %q", entry.Stage)
+	}
+}
+
+func TestLogger_LogSelfImprovementGoal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := NewLogger(path)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+
+	sg := SelfImprovementGoal{
+		GoalID:      "si-goal-1",
+		Description: "optimize cache",
+		Source:      "template-generator",
+		Confidence:  0.85,
+	}
+	if err := logger.LogSelfImprovementGoal("session-1", sg); err != nil {
+		t.Fatalf("LogSelfImprovementGoal failed: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	var entry Entry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry.Stage != "selfimprovement:goal" {
+		t.Errorf("expected stage 'selfimprovement:goal', got %q", entry.Stage)
+	}
+}

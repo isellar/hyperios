@@ -21,8 +21,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/isellar/hyperios/internal/audit"
-	"github.com/isellar/hyperios/internal/bus"
-	"github.com/isellar/hyperios/internal/capability"
+	"github.com/isellar/hyperios/internal/events"
+	"github.com/isellar/hyperios/internal/governor/capability"
 	cfg "github.com/isellar/hyperios/internal/config"
 	"github.com/isellar/hyperios/internal/manifest"
 	"github.com/isellar/hyperios/internal/plan"
@@ -34,7 +34,7 @@ import (
 type Shell struct {
 	config     *cfg.Config
 	configPath string // path to persist autonomy changes
-	eventBus   *bus.Bus
+	notifier   *events.Notifier
 	registry   *capability.Registry
 	validator  *capability.CommandValidator
 	manifestSt *manifest.Store
@@ -51,7 +51,7 @@ type Config struct {
 	APIKey        string
 	HypConfig     *cfg.Config
 	ConfigPath    string // path to persist config changes
-	EventBus      *bus.Bus
+	Notifier      *events.Notifier
 	Registry      *capability.Registry
 	Validator     *capability.CommandValidator
 	ManifestStore *manifest.Store
@@ -67,7 +67,7 @@ func NewShell(c Config) *Shell {
 	return &Shell{
 		config:     c.HypConfig,
 		configPath: c.ConfigPath,
-		eventBus:   c.EventBus,
+		notifier:   c.Notifier,
 		registry:   c.Registry,
 		validator:  c.Validator,
 		manifestSt: c.ManifestStore,
@@ -93,10 +93,9 @@ func (s *Shell) Run() error {
 	// Collect startup notifications
 	notifications := s.startupNotifications()
 
-	// Subscribe audit consumer to event bus
-	if s.eventBus != nil {
-		auditCh := s.eventBus.Subscribe()
-		go bus.DrainToAudit(auditCh, s.logger.Log)
+	// Register audit callback on event notifier
+	if s.notifier != nil {
+		s.notifier.SetAuditCallback(s.logger.Log)
 	}
 
 	// Build pipeline runner
@@ -104,7 +103,7 @@ func (s *Shell) Run() error {
 		APIKey:        s.apiKey,
 		AutonomyLevel: s.config.AutonomyLevel,
 		ExecutorType:  "local",
-		EventBus:      s.eventBus,
+		Notifier:      s.notifier,
 		Registry:      s.registry,
 		Validator:     s.validator,
 		Manifest:      s.manifestSt,
@@ -135,7 +134,7 @@ func (s *Shell) Run() error {
 			}
 		},
 	}
-	model := New(s.eventBus, runner, notifications, s.workDir, vc, ac)
+	model := New(s.notifier, runner, notifications, s.workDir, vc, ac)
 
 	// Run bubbletea.
 	// WithMouseCellMotion is intentionally omitted: enabling bubbletea mouse
@@ -257,7 +256,7 @@ func wrapWithRouter(fallback PipelineRunner, s *Shell) PipelineRunner {
 		Fallback:      func(intent, _ string) error { return fallback(intent, "") },
 		Registry:      s.registry,
 		Validator:     s.validator,
-		EventBus:      s.eventBus,
+		Notifier:      s.notifier,
 		SessionID:     "",
 		AutonomyLevel: s.config.AutonomyLevel,
 		WorkspaceDir:  s.workDir,

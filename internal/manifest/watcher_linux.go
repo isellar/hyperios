@@ -10,7 +10,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/events"
 )
 
 const (
@@ -28,7 +28,7 @@ const (
 // when changes are detected.
 type Watcher struct {
 	store     *Store
-	eventBus  *bus.Bus
+	notifier  *events.Notifier
 	watchPaths []string
 	fd        int
 	wds       map[int]string // watch descriptor → path
@@ -36,7 +36,7 @@ type Watcher struct {
 }
 
 // NewWatcher creates a Watcher for the given paths.
-func NewWatcher(store *Store, eventBus *bus.Bus, watchPaths []string) (*Watcher, error) {
+func NewWatcher(store *Store, notifier *events.Notifier, watchPaths []string) (*Watcher, error) {
 	fd, err := syscall.InotifyInit1(syscall.IN_CLOEXEC | syscall.IN_NONBLOCK)
 	if err != nil {
 		return nil, err
@@ -44,7 +44,7 @@ func NewWatcher(store *Store, eventBus *bus.Bus, watchPaths []string) (*Watcher,
 
 	w := &Watcher{
 		store:      store,
-		eventBus:   eventBus,
+		notifier:   notifier,
 		watchPaths: watchPaths,
 		fd:         fd,
 		wds:        make(map[int]string),
@@ -125,9 +125,9 @@ func (w *Watcher) handleChange(path string) {
 	}
 
 	// Publish manifest updated event
-	if w.eventBus != nil {
-		w.eventBus.Publish(bus.Event{
-			Kind:      bus.EventManifestUpdated,
+	if w.notifier != nil {
+		w.notifier.Publish(events.Event{
+			Kind:      events.EventManifestUpdated,
 			Payload:   path,
 			Timestamp: time.Now(),
 		})

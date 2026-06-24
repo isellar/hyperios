@@ -53,3 +53,56 @@ func (l *Logger) Log(sessionID, stage string, input, output any) error {
 	_, err = fmt.Fprintf(f, "%s\n", data)
 	return err
 }
+
+// GoalTransition records a goal state change.
+type GoalTransition struct {
+	GoalID    string `json:"goal_id"`
+	FromState string `json:"from_state"`
+	ToState   string `json:"to_state"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// ToolAuthEvent records a tool authorization request or decision.
+type ToolAuthEvent struct {
+	ToolID       string `json:"tool_id"`
+	Scope        string `json:"scope"`
+	AuthorizedBy string `json:"authorized_by,omitempty"`
+	Approved     bool   `json:"approved"`
+	Reason       string `json:"reason,omitempty"`
+}
+
+// AgentSpawnEvent records the creation of a sub-agent.
+type AgentSpawnEvent struct {
+	AgentType  string `json:"agent_type"`
+	ParentID   string `json:"parent_id,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	SpawnCount int    `json:"spawn_count"`
+}
+
+// SelfImprovementGoal records a goal created by the self-improvement system.
+type SelfImprovementGoal struct {
+	GoalID      string `json:"goal_id"`
+	Description string `json:"description"`
+	Source      string `json:"source"`
+	Confidence  float64 `json:"confidence"`
+}
+
+// LogGoalTransition logs a goal state transition.
+func (l *Logger) LogGoalTransition(sessionID string, t GoalTransition) error {
+	return l.Log(sessionID, "goal:transition", t, nil)
+}
+
+// LogToolAuthorization logs a tool authorization event.
+func (l *Logger) LogToolAuthorization(sessionID string, t ToolAuthEvent) error {
+	return l.Log(sessionID, "tool:authorization", t, nil)
+}
+
+// LogAgentSpawn logs the creation of a sub-agent.
+func (l *Logger) LogAgentSpawn(sessionID string, e AgentSpawnEvent) error {
+	return l.Log(sessionID, "agent:spawn", e, nil)
+}
+
+// LogSelfImprovementGoal logs a self-improvement goal creation.
+func (l *Logger) LogSelfImprovementGoal(sessionID string, g SelfImprovementGoal) error {
+	return l.Log(sessionID, "selfimprovement:goal", g, nil)
+}

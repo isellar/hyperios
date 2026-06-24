@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/events"
 	"github.com/isellar/hyperios/internal/capability"
 	"github.com/isellar/hyperios/internal/display"
 	"github.com/isellar/hyperios/internal/types"
@@ -31,26 +31,26 @@ type LocalExecutor struct {
 	registry  *capability.Registry
 	enforcer  *capability.Enforcer
 	workspace string
-	eventBus  *bus.Bus
+	notifier  *events.Notifier
 	sessionID string
 }
 
-func NewLocal(registry *capability.Registry, workspace string, eventBus *bus.Bus, sessionID string) *LocalExecutor {
+func NewLocal(registry *capability.Registry, workspace string, notifier *events.Notifier, sessionID string) *LocalExecutor {
 	return &LocalExecutor{
 		registry:  registry,
 		enforcer:  capability.NewEnforcer(registry),
 		workspace: workspace,
-		eventBus:  eventBus,
+		notifier:  notifier,
 		sessionID: sessionID,
 	}
 }
 
-// publish sends an event on the bus if one is configured.
-func (e *LocalExecutor) publish(kind bus.EventKind, stepID string, payload any) {
-	if e.eventBus == nil {
+// publish sends an event to the notifier if one is configured.
+func (e *LocalExecutor) publish(kind events.EventKind, stepID string, payload any) {
+	if e.notifier == nil {
 		return
 	}
-	e.eventBus.PublishStep(kind, e.sessionID, stepID, payload)
+	e.notifier.PublishStep(kind, e.sessionID, stepID, payload)
 }
 
 func (e *LocalExecutor) Name() string {
@@ -90,7 +90,7 @@ func (e *LocalExecutor) Execute(ctx context.Context, step types.ActionStep) (*ty
 	var result *types.ExecutionResult
 	var lastErr error
 
-	e.publish(bus.EventStepStarted, step.ID, step.Description)
+	e.publish(events.EventStepStarted, step.ID, step.Description)
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
@@ -137,7 +137,7 @@ func (e *LocalExecutor) Execute(ctx context.Context, step types.ActionStep) (*ty
 	}
 
 	if lastErr == nil {
-		e.publish(bus.EventStepCompleted, step.ID, result)
+		e.publish(events.EventStepCompleted, step.ID, result)
 		return result, nil
 	}
 
@@ -145,13 +145,13 @@ func (e *LocalExecutor) Execute(ctx context.Context, step types.ActionStep) (*ty
 	switch step.OnFailure {
 	case "skip":
 		result.Error = fmt.Sprintf("skipped: %s", lastErr)
-		e.publish(bus.EventStepSkipped, step.ID, result.Error)
+		e.publish(events.EventStepSkipped, step.ID, result.Error)
 		return result, ErrStepSkipped
 	case "replan":
-		e.publish(bus.EventStepFailed, step.ID, result.Error)
+		e.publish(events.EventStepFailed, step.ID, result.Error)
 		return result, ErrReplan
 	default:
-		e.publish(bus.EventStepFailed, step.ID, result.Error)
+		e.publish(events.EventStepFailed, step.ID, result.Error)
 		return result, lastErr
 	}
 }

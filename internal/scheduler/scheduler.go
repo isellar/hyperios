@@ -1,7 +1,7 @@
 // Package scheduler manages in-process recurring tasks for HyperiOS.
 //
-// It wraps robfig/cron with a named job registry and event bus integration.
-// Scheduled jobs publish EventScheduledFired to the bus when they run.
+// It wraps robfig/cron with a named job registry and event notification.
+// Scheduled jobs publish EventScheduledFired when they run.
 //
 // This scheduler handles agent-internal cadence: manifest re-scan, session
 // cleanup, audit log rotation. For user-directed recurring tasks that must
@@ -15,7 +15,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 
-	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/events"
 )
 
 // Job is a registered recurring task.
@@ -27,18 +27,18 @@ type Job struct {
 
 // Scheduler wraps robfig/cron with a named job registry.
 type Scheduler struct {
-	mu    sync.RWMutex
-	cron  *cron.Cron
-	jobs  map[string]*Job
-	bus   *bus.Bus
+	mu       sync.RWMutex
+	cron     *cron.Cron
+	jobs     map[string]*Job
+	notifier *events.Notifier
 }
 
-// New creates a Scheduler. If eventBus is nil, events are not published.
-func New(eventBus *bus.Bus) *Scheduler {
+// New creates a Scheduler. If notifier is nil, events are not published.
+func New(notifier *events.Notifier) *Scheduler {
 	return &Scheduler{
-		cron: cron.New(cron.WithSeconds()),
-		jobs: make(map[string]*Job),
-		bus:  eventBus,
+		cron:     cron.New(cron.WithSeconds()),
+		jobs:     make(map[string]*Job),
+		notifier: notifier,
 	}
 }
 
@@ -53,13 +53,13 @@ func (s *Scheduler) Register(name, cronExpr string, fn func()) error {
 		return fmt.Errorf("scheduler: job %q already registered", name)
 	}
 
-	eventBus := s.bus
+	notifier := s.notifier
 	jobName := name
 
 	id, err := s.cron.AddFunc(cronExpr, func() {
-		if eventBus != nil {
-			eventBus.Publish(bus.Event{
-				Kind:      bus.EventScheduledFired,
+		if notifier != nil {
+			notifier.Publish(events.Event{
+				Kind:      events.EventScheduledFired,
 				SessionID: "",
 				Payload:   jobName,
 				Timestamp: time.Now(),

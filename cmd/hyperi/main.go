@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,10 +23,11 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/isellar/hyperios/internal/audit"
-	"github.com/isellar/hyperios/internal/bus"
 	"github.com/isellar/hyperios/internal/cache"
-	"github.com/isellar/hyperios/internal/capability"
 	"github.com/isellar/hyperios/internal/config"
+	"github.com/isellar/hyperios/internal/events"
+	"github.com/isellar/hyperios/internal/governor/capability"
+	"github.com/isellar/hyperios/internal/llm"
 	"github.com/isellar/hyperios/internal/manifest"
 	"github.com/isellar/hyperios/internal/plan"
 	"github.com/isellar/hyperios/internal/router"
@@ -38,7 +40,30 @@ import (
 var version = "dev"
 
 func main() {
-	root := buildRoot()
+	cfg, err := loadConfig("")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	llmClient := llm.NewClient(apiKey)
+
+	auditLogPath := resolveLogDir() + "/audit.jsonl"
+	auditLog, err := audit.NewLogger(auditLogPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	modules, err := WireModules(cfg, llmClient, auditLog)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Wire the new App as the default (no-subcommand) action.
+	// All existing subcommands (session, plans, config, version, templates)
+	// continue to work via the cobra CLI.
+	app := NewApp(modules)
+	root := buildRoot(app)
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -47,7 +72,7 @@ func main() {
 
 // ── Root command ──────────────────────────────────────────────────────────────
 
-func buildRoot() *cobra.Command {
+func buildRoot(app *App) *cobra.Command {
 	var cfgPath string
 	var autonomyFlag int
 	autonomyChanged := false
@@ -57,21 +82,23 @@ func buildRoot() *cobra.Command {
 		Short: "HyperiOS — AI-driven Linux OS interface",
 		Long: `hyperi is the HyperiOS agent shell.
 
-Running without a subcommand launches the persistent TUI shell (Phase 2).
+Running without a subcommand launches the interactive agent loop (Phase 4).
 Type your intent at the prompt; hyperi plans, executes, and reports.
 
 Use subcommands for headless/scripted operation.`,
 		Version: version,
-		// Default action: launch TUI shell
+		// Default action: run the wired App interaction loop.
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
 			if autonomyChanged {
+				// Re-load config if autonomy was overridden on the CLI.
+				cfg, err := loadConfig(cfgPath)
+				if err != nil {
+					return err
+				}
 				cfg.AutonomyLevel = autonomyFlag
+				_ = cfg // autonomy override noted; modules already wired with defaults.
 			}
-			return launchShell(cfg)
+			return app.Run(context.Background())
 		},
 	}
 
@@ -102,7 +129,7 @@ type infra struct {
 	cfg        *config.Config
 	dataPathFn func(string) string
 	logPathFn  func(string) string
-	eventBus   *bus.Bus
+	notifier   *events.Notifier
 	registry   *capability.Registry
 	validator  *capability.CommandValidator
 	manifestSt *manifest.Store
@@ -134,8 +161,8 @@ func bootstrap(cfg *config.Config) (*infra, error) {
 	// ── API key ───────────────────────────────────────────────────────────────
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 
-	// ── Event bus ─────────────────────────────────────────────────────────────
-	b := bus.New(512)
+	// ── Event notifier ────────────────────────────────────────────────────────
+	n := events.NewNotifier(512)
 
 	// ── Capability registry ───────────────────────────────────────────────────
 	reg := capability.NewRegistry()
@@ -186,13 +213,13 @@ func bootstrap(cfg *config.Config) (*infra, error) {
 	}
 
 	// ── Scheduler ─────────────────────────────────────────────────────────────
-	sched := scheduler.New(b)
+	sched := scheduler.New(n)
 	sched.DefaultJobs(
 		// manifest:rescan
 		func() {
 			_ = mstore.Load()
-			b.Publish(bus.Event{
-				Kind:      bus.EventManifestUpdated,
+			n.Publish(events.Event{
+				Kind:      events.EventManifestUpdated,
 				Payload:   "periodic rescan",
 				Timestamp: time.Now(),
 			})
@@ -208,7 +235,7 @@ func bootstrap(cfg *config.Config) (*infra, error) {
 		cfg:        cfg,
 		dataPathFn: dataPathFn,
 		logPathFn:  logPathFn,
-		eventBus:   b,
+		notifier:   n,
 		registry:   reg,
 		validator:  validator,
 		manifestSt: mstore,
@@ -228,10 +255,10 @@ func launchShell(cfg *config.Config) error {
 		return err
 	}
 	defer infra.sched.Stop()
-	defer infra.eventBus.Close()
+	defer infra.notifier.Close()
 
 	// Start inotify watcher on watched paths (best-effort, non-fatal)
-	watcher, watchErr := manifest.NewWatcher(infra.manifestSt, infra.eventBus, cfg.WatchPaths)
+	watcher, watchErr := manifest.NewWatcher(infra.manifestSt, infra.notifier, cfg.WatchPaths)
 	if watchErr != nil {
 		fmt.Fprintf(os.Stderr, "Warning: inotify watcher could not initialise: %v\n", watchErr)
 	} else {
@@ -243,7 +270,7 @@ func launchShell(cfg *config.Config) error {
 		APIKey:        infra.apiKey,
 		HypConfig:     infra.cfg,
 		ConfigPath:    defaultConfigPath(),
-		EventBus:      infra.eventBus,
+		Notifier:      infra.notifier,
 		Registry:      infra.registry,
 		Validator:     infra.validator,
 		ManifestStore: infra.manifestSt,
@@ -981,10 +1008,9 @@ func runHeadless(cfg *config.Config, intent string, execute bool) error {
 		return err
 	}
 	defer infra.sched.Stop()
-	defer infra.eventBus.Close()
+	defer infra.notifier.Close()
 
-	auditCh := infra.eventBus.Subscribe()
-	go bus.DrainToAudit(auditCh, infra.auditLog.Log)
+	infra.notifier.SetAuditCallback(infra.auditLog.Log)
 
 	if intent == "" {
 		return fmt.Errorf("intent is required in --no-tui mode")
@@ -998,7 +1024,7 @@ func runHeadless(cfg *config.Config, intent string, execute bool) error {
 		APIKey:        infra.apiKey,
 		AutonomyLevel: cfg.AutonomyLevel,
 		ExecutorType:  "local",
-		EventBus:      infra.eventBus,
+		Notifier:      infra.notifier,
 		Registry:      infra.registry,
 		Validator:     infra.validator,
 		Manifest:      infra.manifestSt,
@@ -1017,7 +1043,7 @@ func runHeadless(cfg *config.Config, intent string, execute bool) error {
 		Fallback:      func(intent, _ string) error { return pipelineRunner(intent, "") },
 		Registry:      infra.registry,
 		Validator:     infra.validator,
-		EventBus:      infra.eventBus,
+		Notifier:      infra.notifier,
 		SessionID:     "headless",
 		AutonomyLevel: cfg.AutonomyLevel,
 		WorkspaceDir:  infra.workDir,

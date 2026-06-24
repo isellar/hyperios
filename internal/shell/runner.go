@@ -12,12 +12,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/isellar/hyperios/internal/agents"
-	"github.com/isellar/hyperios/internal/arbiter"
+	"github.com/isellar/hyperios/internal/governor"
 	"github.com/isellar/hyperios/internal/audit"
-	"github.com/isellar/hyperios/internal/bus"
-	"github.com/isellar/hyperios/internal/capability"
+	"github.com/isellar/hyperios/internal/events"
+	"github.com/isellar/hyperios/internal/governor/capability"
 	cfg "github.com/isellar/hyperios/internal/config"
-	"github.com/isellar/hyperios/internal/executor"
+	"github.com/isellar/hyperios/internal/governor/executor"
 	"github.com/isellar/hyperios/internal/llm"
 	"github.com/isellar/hyperios/internal/manifest"
 	"github.com/isellar/hyperios/internal/plan"
@@ -32,7 +32,7 @@ type RunnerConfig struct {
 	APIKey        string
 	AutonomyLevel int
 	ExecutorType  string
-	EventBus      *bus.Bus
+	Notifier      *events.Notifier
 	Registry      *capability.Registry
 	Validator     *capability.CommandValidator
 	Manifest      *manifest.Store
@@ -96,7 +96,7 @@ func NewPipelineRunner(rc RunnerConfig) PipelineRunner {
 			planWriter:    planWriter,
 			sessionMgr:    rc.SessionMgr,
 			state:         state,
-			eventBus:      rc.EventBus,
+			notifier:      rc.Notifier,
 			hypCfg:        rc.Config,
 			dataPathFn:    rc.DataPathFn,
 			attempt:       1,
@@ -133,9 +133,9 @@ func resumeFromPlanDoc(ctx context.Context, sessionID string, rc RunnerConfig, c
 
 	ws := gatherWorkspaceContext(rc.WorkspaceDir)
 
-	pub := func(kind bus.EventKind, payload any) {
-		if rc.EventBus != nil {
-			rc.EventBus.Publish(bus.Event{
+	pub := func(kind events.EventKind, payload any) {
+		if rc.Notifier != nil {
+			rc.Notifier.Publish(events.Event{
 				Kind:      kind,
 				SessionID: sessionID,
 				Payload:   payload,
@@ -144,7 +144,7 @@ func resumeFromPlanDoc(ctx context.Context, sessionID string, rc RunnerConfig, c
 		}
 	}
 
-	pub(bus.EventKind("session:resuming"), fmt.Sprintf("Resuming session %s from last checkpoint", sessionID))
+	pub(events.EventKind("session:resuming"), fmt.Sprintf("Resuming session %s from last checkpoint", sessionID))
 
 	// Determine the first incomplete stage
 	nextStage := planState.NextPendingStage()
@@ -170,7 +170,7 @@ func resumeFromPlanDoc(ctx context.Context, sessionID string, rc RunnerConfig, c
 			planWriter:    planWriter,
 			sessionMgr:    rc.SessionMgr,
 			state:         sessState,
-			eventBus:      rc.EventBus,
+			notifier:      rc.Notifier,
 			hypCfg:        rc.Config,
 			dataPathFn:    rc.DataPathFn,
 			attempt:       planState.Attempt,
@@ -181,7 +181,7 @@ func resumeFromPlanDoc(ctx context.Context, sessionID string, rc RunnerConfig, c
 	// One or more LLM stages didn't complete — re-run from the first
 	// incomplete stage. For simplicity in v1, re-run from the beginning
 	// (stages are fast and idempotent when appending to the plan doc).
-	pub(bus.EventKind("session:resuming"), fmt.Sprintf("Re-running from stage: %s", nextStage))
+	pub(events.EventKind("session:resuming"), fmt.Sprintf("Re-running from stage: %s", nextStage))
 
 	return runPipeline(ctx, pipelineArgs{
 		sessionID:     sessionID,
@@ -197,7 +197,7 @@ func resumeFromPlanDoc(ctx context.Context, sessionID string, rc RunnerConfig, c
 		planWriter:    planWriter,
 		sessionMgr:    rc.SessionMgr,
 		state:         sessState,
-		eventBus:      rc.EventBus,
+		notifier:      rc.Notifier,
 		hypCfg:        rc.Config,
 		dataPathFn:    rc.DataPathFn,
 		attempt:       planState.Attempt,
@@ -219,7 +219,7 @@ type pipelineArgs struct {
 	planWriter    *plan.Writer
 	sessionMgr    *session.Manager
 	state         *session.State
-	eventBus      *bus.Bus
+	notifier      *events.Notifier
 	hypCfg        *cfg.Config
 	dataPathFn    func(string) string
 	attempt       int
@@ -230,9 +230,9 @@ type pipelineArgs struct {
 }
 
 func runPipeline(ctx context.Context, a pipelineArgs) error {
-	pub := func(kind bus.EventKind, payload any) {
-		if a.eventBus != nil {
-			a.eventBus.Publish(bus.Event{
+	pub := func(kind events.EventKind, payload any) {
+		if a.notifier != nil {
+			a.notifier.Publish(events.Event{
 				Kind:      kind,
 				SessionID: a.sessionID,
 				Payload:   payload,
@@ -257,7 +257,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	// ── Intent Agent ──────────────────────────────────────────────────────────
 	var graph *types.GoalGraph
 	if stageComplete("intent") {
-		pub(bus.EventKind("stage:skipped"), "intent (already completed)")
+		pub(events.EventKind("stage:skipped"), "intent (already completed)")
 		graph = a.state.ToGoalGraph()
 		if len(graph.Goals) == 0 && a.resumeState != nil {
 			graph = a.resumeState.IntentGraph
@@ -271,7 +271,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		graph, err = agents.NewIntentAgent(a.client).Run(ctx, a.intent, a.ws)
 		if err != nil {
 			_ = a.planWriter.WriteStageFailed("intent", err)
-			pub(bus.EventPlanFailed, err.Error())
+			pub(events.EventPlanFailed, err.Error())
 			return err
 		}
 		_ = a.planWriter.WriteStageComplete("intent", marshalJSON(graph), "hyperi-intent")
@@ -282,7 +282,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	// ── Planner Agent ─────────────────────────────────────────────────────────
 	var agentPlan *types.ActionPlan
 	if stageComplete("plan") {
-		pub(bus.EventKind("stage:skipped"), "plan (already completed)")
+		pub(events.EventKind("stage:skipped"), "plan (already completed)")
 		agentPlan = a.state.Plan
 		if agentPlan == nil && a.resumeState != nil {
 			agentPlan = a.resumeState.Plan
@@ -296,7 +296,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		agentPlan, err = agents.NewPlannerAgent(a.client).Run(ctx, graph)
 		if err != nil {
 			_ = a.planWriter.WriteStageFailed("plan", err)
-			pub(bus.EventPlanFailed, err.Error())
+			pub(events.EventPlanFailed, err.Error())
 			return err
 		}
 		_ = a.planWriter.WriteStageComplete("plan", marshalJSON(agentPlan), "hyperi-plan")
@@ -304,12 +304,12 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		a.state.Plan = agentPlan
 	}
 
-	pub(bus.EventKind("plan:ready"), agentPlan)
+	pub(events.EventKind("plan:ready"), agentPlan)
 
 	// ── Adversarial Agent ─────────────────────────────────────────────────────
 	var report *types.RiskReport
 	if stageComplete("adversarial") {
-		pub(bus.EventKind("stage:skipped"), "adversarial (already completed)")
+		pub(events.EventKind("stage:skipped"), "adversarial (already completed)")
 		report = &types.RiskReport{}
 		if a.resumeState != nil && a.resumeState.RiskReport != nil {
 			report = a.resumeState.RiskReport
@@ -317,10 +317,10 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	} else {
 		_ = a.planWriter.WriteStageStart("adversarial")
 		var err error
-		report, err = agents.NewAdversarialAgent(a.client).Run(ctx, graph, agentPlan)
+		report, err = governor.NewAdversarialAgent(a.client).Run(ctx, graph, agentPlan)
 		if err != nil {
 			_ = a.planWriter.WriteStageFailed("adversarial", err)
-			pub(bus.EventPlanFailed, err.Error())
+			pub(events.EventPlanFailed, err.Error())
 			return err
 		}
 		_ = a.planWriter.WriteStageComplete("adversarial", marshalJSON(report), "hyperi-risk")
@@ -330,11 +330,11 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	// ── Arbiter ───────────────────────────────────────────────────────────────
 	var verdicts []types.ArbiterVerdict
 	if stageComplete("arbiter") && a.resumeState != nil && len(a.resumeState.Verdicts) > 0 {
-		pub(bus.EventKind("stage:skipped"), "arbiter (already completed)")
+		pub(events.EventKind("stage:skipped"), "arbiter (already completed)")
 		verdicts = a.resumeState.Verdicts
 	} else {
 		_ = a.planWriter.WriteStageStart("arbiter")
-		policyArbiter := arbiter.NewWithLevel(a.autonomyLevel)
+		policyArbiter := governor.NewArbiterWithLevel(a.autonomyLevel)
 		verdicts = policyArbiter.Decide(agentPlan, report)
 		_ = a.logger.Log(a.sessionID, "arbiter", agentPlan, verdicts)
 		for _, step := range agentPlan.Steps {
@@ -346,7 +346,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		_ = a.planWriter.WriteStageComplete("arbiter", marshalJSON(verdicts), "hyperi-arbiter")
 	}
 
-	pub(bus.EventKind("plan:verdicts"), &planVerdicts{
+	pub(events.EventKind("plan:verdicts"), &planVerdicts{
 		Plan:     agentPlan,
 		Verdicts: verdicts,
 		Report:   report,
@@ -354,7 +354,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 
 	// ── Execute ───────────────────────────────────────────────────────────────
 	if a.autonomyLevel == 0 {
-		pub(bus.EventPlanCompleted, "plan presented as suggestion (autonomy level 0)")
+		pub(events.EventPlanCompleted, "plan presented as suggestion (autonomy level 0)")
 		_ = a.planWriter.Finalize(plan.StatusCompleted)
 		a.state.Status = "completed"
 		_ = a.sessionMgr.Save(a.state)
@@ -365,7 +365,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		Registry:     a.registry,
 		Workspace:    a.ws.Cwd,
 		ExecutorType: types.ExecutorType(a.executorType),
-		Bus:          a.eventBus,
+		Notifier:     a.notifier,
 		SessionID:    a.sessionID,
 	}
 	execInstance := executor.New(execCfg)
@@ -378,7 +378,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	for _, step := range agentPlan.Steps {
 		// On resume: skip steps that already completed or were skipped.
 		if stepComplete(step.ID) {
-			pub(bus.EventStepSkipped, fmt.Sprintf("%s (already completed)", step.ID))
+			pub(events.EventStepSkipped, fmt.Sprintf("%s (already completed)", step.ID))
 			continue
 		}
 
@@ -396,7 +396,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 			// Publish approval request to TUI via event bus
 			replyCh := make(chan bool, 1)
 			timeout := a.hypCfg.ApprovalTimeoutForeground
-			ap := &bus.ApprovalPayload{
+			ap := &events.ApprovalPayload{
 				StepID:         step.ID,
 				StepDesc:       step.Description,
 				Command:        step.Command,
@@ -404,7 +404,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 				TimeoutSeconds: timeout,
 				ReplyCh:        replyCh,
 			}
-			pub(bus.EventApprovalNeeded, ap)
+			pub(events.EventApprovalNeeded, ap)
 
 			// Block waiting for reply
 			select {
@@ -414,7 +414,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 					_ = a.planWriter.Finalize(plan.StatusHalted)
 					a.state.Status = "halted"
 					_ = a.sessionMgr.Save(a.state)
-					pub(bus.EventPlanFailed, fmt.Sprintf("user denied approval for step %s", step.ID))
+					pub(events.EventPlanFailed, fmt.Sprintf("user denied approval for step %s", step.ID))
 					return fmt.Errorf("user denied approval for step %s", step.ID)
 				}
 			case <-time.After(time.Duration(timeout) * time.Second):
@@ -422,7 +422,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 				_ = a.planWriter.Finalize(plan.StatusHalted)
 				a.state.Status = "halted"
 				_ = a.sessionMgr.Save(a.state)
-				pub(bus.EventPlanFailed, "approval-timeout")
+				pub(events.EventPlanFailed, "approval-timeout")
 				return fmt.Errorf("approval timed out for step %s", step.ID)
 			case <-ctx.Done():
 				return ctx.Err()
@@ -432,7 +432,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		if vr := a.validator.Validate(step); !vr.Valid {
 			_ = a.planWriter.WriteStepSkipped(step, vr.Reason)
 			// Publish so the TUI shows why the step was skipped
-			pub(bus.EventStepSkipped, vr.Reason)
+			pub(events.EventStepSkipped, vr.Reason)
 			stepResults = append(stepResults, stepResult{step: step, skipped: true, reason: vr.Reason})
 			continue
 		}
@@ -454,7 +454,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 			_ = a.planWriter.Finalize(plan.StatusHalted)
 			a.state.Status = "halted"
 			_ = a.sessionMgr.Save(a.state)
-			pub(bus.EventPlanFailed, execErr.Error())
+			pub(events.EventPlanFailed, execErr.Error())
 			return execErr
 		}
 
@@ -477,14 +477,14 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 
 		if requiresConfirmation {
 			replyCh := make(chan bool, 1)
-			ap := &bus.ApprovalPayload{
+			ap := &events.ApprovalPayload{
 				StepID:         "replan",
 				StepDesc:       fmt.Sprintf("Attempt %d of %d failed. Proceed with re-plan?", a.attempt+1, maxReplans+1),
 				Reason:         "re-plan budget: user confirmation required",
 				TimeoutSeconds: a.hypCfg.ApprovalTimeoutForeground,
 				ReplyCh:        replyCh,
 			}
-			pub(bus.EventApprovalNeeded, ap)
+			pub(events.EventApprovalNeeded, ap)
 			select {
 			case approved := <-replyCh:
 				if !approved {
@@ -506,13 +506,13 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 	// Ask the LLM to summarise all step outputs into a plain-English answer
 	// for the user, then publish it as a plan:response event for the TUI.
 	responseText := synthesiseResponse(ctx, a.client, a.intent, stepResults)
-	pub(bus.EventKind("plan:response"), responseText)
+	pub(events.EventKind("plan:response"), responseText)
 	_ = a.planWriter.WriteStageComplete("response", responseText, "hyperi-response")
 
 	_ = a.planWriter.Finalize(plan.StatusCompleted)
 	a.state.Status = "completed"
 	_ = a.sessionMgr.Save(a.state)
-	pub(bus.EventPlanCompleted, "all steps completed")
+	pub(events.EventPlanCompleted, "all steps completed")
 	return nil
 }
 
