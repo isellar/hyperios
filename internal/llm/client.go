@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,23 @@ import (
 )
 
 const Model = anthropic.ModelClaudeSonnet4_6
+
+// DefaultZenModel is the OpenCode Zen model ID used when no override is set.
+// See https://opencode.ai/zen/v1/models for the full catalog.
+const DefaultZenModel = "claude-sonnet-5"
+
+// ZenBaseURL is the OpenCode Zen API endpoint. Zen exposes an
+// Anthropic-messages-compatible API at this base URL, authenticated the same
+// way as Anthropic's own API (X-Api-Key header), which is what
+// option.WithAPIKey sends. See https://opencode.ai/docs/zen/
+const ZenBaseURL = "https://opencode.ai/zen"
+
+// ProviderAnthropic and ProviderOpenCodeZen are the supported provider names
+// for NewClientWithConfig / NewClientForProvider.
+const (
+	ProviderAnthropic   = "anthropic"
+	ProviderOpenCodeZen = "opencode-zen"
+)
 
 // Error types for stage-level retry decisions.
 
@@ -50,7 +68,7 @@ func (e *MalformedResponseError) Error() string {
 
 // Client wraps the Anthropic SDK for simple prompt→JSON calls.
 type Client struct {
-	inner   *anthropic.Client
+	inner    *anthropic.Client
 	provider string
 	model    string
 
@@ -62,35 +80,67 @@ type Client struct {
 
 // TokenUsage returns the cumulative token usage for this client.
 type TokenUsage struct {
-	InputTokens  int64
-	OutputTokens int64
-	TotalTokens  int64
+	InputTokens   int64
+	OutputTokens  int64
+	TotalTokens   int64
 	EstimatedCost float64
 }
 
 // NewClient creates an Anthropic client. API key is read from ANTHROPIC_API_KEY
 // env var by the SDK automatically; pass an explicit key to override.
 func NewClient(apiKey string) *Client {
-	return NewClientWithConfig(apiKey, "anthropic", "")
+	return NewClientWithConfig(apiKey, ProviderAnthropic, "")
 }
 
 // NewClientWithConfig creates a client with explicit provider and model settings.
-// Provider is currently informational; only "anthropic" is supported.
-// Model overrides the default model if non-empty.
+// Supported providers:
+//   - "anthropic" (default): talks directly to api.anthropic.com.
+//   - "opencode-zen": routes through OpenCode Zen (opencode.ai/zen), an
+//     Anthropic-messages-compatible gateway to many models. Useful as a
+//     fallback when the Anthropic account is out of quota/tokens.
+//
+// Model overrides the default model if non-empty; for "opencode-zen" it
+// defaults to DefaultZenModel instead of Model.
 func NewClientWithConfig(apiKey, provider, model string) *Client {
+	if provider == "" {
+		provider = ProviderAnthropic
+	}
+
 	opts := []option.RequestOption{}
 	if apiKey != "" {
 		opts = append(opts, option.WithAPIKey(apiKey))
 	}
-	c := anthropic.NewClient(opts...)
-	if provider == "" {
-		provider = "anthropic"
+	if provider == ProviderOpenCodeZen {
+		opts = append(opts, option.WithBaseURL(ZenBaseURL))
+		if model == "" {
+			model = DefaultZenModel
+		}
 	}
+
+	c := anthropic.NewClient(opts...)
 	return &Client{
 		inner:    &c,
 		provider: provider,
 		model:    model,
 	}
+}
+
+// NewClientForProvider builds a Client for the named provider, applying
+// sane env-var fallbacks when apiKey is empty:
+//   - "anthropic":    ANTHROPIC_API_KEY
+//   - "opencode-zen": OPENCODE_API_KEY
+//
+// An unknown/empty provider is treated as "anthropic".
+func NewClientForProvider(provider, apiKey, model string) *Client {
+	if apiKey == "" {
+		switch provider {
+		case ProviderOpenCodeZen:
+			apiKey = os.Getenv("OPENCODE_API_KEY")
+		default:
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		}
+	}
+	return NewClientWithConfig(apiKey, provider, model)
 }
 
 // Usage returns the cumulative token usage and estimated cost.
@@ -145,7 +195,7 @@ func estimateCost(model string, input, output int64) float64 {
 func (c *Client) Complete(ctx context.Context, system, user string) (string, error) {
 	msg, err := c.inner.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(c.resolveModel()),
-		MaxTokens: 4096,
+		MaxTokens: 16384,
 		System: []anthropic.TextBlockParam{
 			{Text: system},
 		},
@@ -162,6 +212,15 @@ func (c *Client) Complete(ctx context.Context, system, user string) (string, err
 
 	c.trackUsage(msg.Usage.InputTokens, msg.Usage.OutputTokens)
 
+	// Detect truncation — if the model hit max_tokens, the output is likely
+	// incomplete JSON that will fail to parse. Surface a clear error so the
+	// caller can retry or the user sees what happened.
+	if msg.StopReason == anthropic.StopReasonMaxTokens {
+		return "", &MalformedResponseError{
+			Raw: "response truncated at max_tokens — plan may be too large; consider fewer steps",
+		}
+	}
+
 	var sb strings.Builder
 	for _, block := range msg.Content {
 		if block.Type == "text" {
@@ -175,7 +234,7 @@ func (c *Client) Complete(ctx context.Context, system, user string) (string, err
 // It is the preferred entry point for all pipeline stage LLM calls.
 func (c *Client) CompleteWithRetry(ctx context.Context, system, user string) (string, error) {
 	const (
-		maxNetworkRetries  = 3
+		maxNetworkRetries   = 3
 		maxRateLimitRetries = 5
 		maxMalformedRetries = 2
 	)

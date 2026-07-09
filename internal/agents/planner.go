@@ -77,6 +77,7 @@ PACKAGE AND VERSION QUERIES — use these exact patterns:
   To check Chrome version via the binary:   ["google-chrome", "--version"]  — only use if "which google-chrome" succeeded first
 
 RULES:
+- Include a short "name" field (5-8 words, title case) summarising the plan's overall goal — this is shown to the user in plan listings instead of a raw session ID.
 - Break goals into the minimal ordered steps needed to achieve them.
 - command array must contain only literal strings — no shell interpolation, no variables.
 - command[0] must be the exact binary name (resolvable by exec.LookPath on Linux).
@@ -91,6 +92,7 @@ RULES:
 Return ONLY valid JSON — no markdown fences, no explanation, no text before or after:
 
 {
+  "name": "Install and start nginx web server",
   "executor": "local",
   "steps": [
     {

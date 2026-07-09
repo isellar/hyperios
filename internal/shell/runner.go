@@ -12,11 +12,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/isellar/hyperios/internal/agents"
-	"github.com/isellar/hyperios/internal/governor"
 	"github.com/isellar/hyperios/internal/audit"
-	"github.com/isellar/hyperios/internal/events"
-	"github.com/isellar/hyperios/internal/governor/capability"
 	cfg "github.com/isellar/hyperios/internal/config"
+	"github.com/isellar/hyperios/internal/events"
+	"github.com/isellar/hyperios/internal/governor"
+	"github.com/isellar/hyperios/internal/governor/capability"
 	"github.com/isellar/hyperios/internal/governor/executor"
 	"github.com/isellar/hyperios/internal/llm"
 	"github.com/isellar/hyperios/internal/manifest"
@@ -53,11 +53,16 @@ const resumePrefix = "__resume__:"
 // existing plan doc for that session and resumes from the last completed step
 // instead of running the full pipeline from scratch.
 func NewPipelineRunner(rc RunnerConfig) PipelineRunner {
-	return func(intent, _ string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	return func(parentCtx context.Context, intent, _ string) error {
+		ctx, cancel := context.WithTimeout(parentCtx, 10*time.Minute)
 		defer cancel()
 
-		client := llm.NewClient(rc.APIKey)
+		provider, model := "", ""
+		if rc.Config != nil {
+			provider = rc.Config.LLMProvider
+			model = rc.Config.LLMModel
+		}
+		client := llm.NewClientForProvider(provider, rc.APIKey, model)
 
 		// ── Resume path ───────────────────────────────────────────────────────
 		if strings.HasPrefix(intent, resumePrefix) {
@@ -226,7 +231,7 @@ type pipelineArgs struct {
 	// resumeState is non-nil when resuming a halted session.
 	// Pipeline stages and execution steps already marked completed in
 	// resumeState are skipped without re-running.
-	resumeState   *plan.PlanState
+	resumeState *plan.PlanState
 }
 
 func runPipeline(ctx context.Context, a pipelineArgs) error {
@@ -299,6 +304,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 			pub(events.EventPlanFailed, err.Error())
 			return err
 		}
+		_ = a.planWriter.WritePlanName(agentPlan.Name)
 		_ = a.planWriter.WriteStageComplete("plan", marshalJSON(agentPlan), "hyperi-plan")
 		_ = a.logger.Log(a.sessionID, "planner", graph, agentPlan)
 		a.state.Plan = agentPlan

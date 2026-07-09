@@ -45,8 +45,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	llmClient := llm.NewClient(apiKey)
+	apiKey := resolveAPIKey(cfg)
+	llmClient := llm.NewClientForProvider(cfg.LLMProvider, apiKey, cfg.LLMModel)
 
 	auditLogPath := resolveLogDir() + "/audit.jsonl"
 	auditLog, err := audit.NewLogger(auditLogPath)
@@ -159,7 +159,7 @@ func bootstrap(cfg *config.Config) (*infra, error) {
 	}
 
 	// ── API key ───────────────────────────────────────────────────────────────
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	apiKey := resolveAPIKey(cfg)
 
 	// ── Event notifier ────────────────────────────────────────────────────────
 	n := events.NewNotifier(512)
@@ -471,9 +471,13 @@ Plan documents are stored at <data-dir>/plans/<session-id>.md`,
 				if info != nil {
 					mod = info.ModTime()
 				}
+				displayName := state.Name
+				if displayName == "" {
+					displayName = strings.TrimSuffix(entry.Name(), ".md")
+				}
 				plans = append(plans, planSummary{
 					path:      path,
-					name:      strings.TrimSuffix(entry.Name(), ".md"),
+					name:      displayName,
 					status:    state.Status,
 					sessionID: state.SessionID,
 					modTime:   mod,
@@ -494,14 +498,14 @@ Plan documents are stored at <data-dir>/plans/<session-id>.md`,
 				return plans[i].modTime.After(plans[j].modTime)
 			})
 
-			fmt.Printf("%-10s  %-12s  %-20s  %s\n", "SESSION", "STATUS", "UPDATED", "FILE")
-			fmt.Println(strings.Repeat("─", 68))
+			fmt.Printf("%-10s  %-12s  %-20s  %s\n", "SESSION", "STATUS", "UPDATED", "NAME")
+			fmt.Println(strings.Repeat("─", 80))
 			for _, p := range plans {
 				fmt.Printf("%-10s  %-12s  %-20s  %s\n",
 					p.sessionID,
 					p.status,
 					p.modTime.Format("2006-01-02 15:04:05"),
-					filepath.Base(p.path),
+					p.name,
 				)
 			}
 			fmt.Printf("\nPlan documents: %s\n", plansDir)
@@ -533,7 +537,8 @@ func buildConfigGetCmd() *cobra.Command {
 		Long: `Get a configuration value by key.
 
 Keys: autonomy_level, approval_timeout_foreground, approval_timeout_background,
-      voice_enabled, voice_push_to_talk_key, whisper_model_path`,
+      voice_enabled, voice_push_to_talk_key, whisper_model_path,
+      llm_provider, llm_api_key, llm_model`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig("")
@@ -554,12 +559,40 @@ Keys: autonomy_level, approval_timeout_foreground, approval_timeout_background,
 				fmt.Printf("%s\n", cfg.VoicePushToTalkKey)
 			case "whisper_model_path":
 				fmt.Printf("%s\n", cfg.WhisperModelPath)
+			case "llm_provider":
+				fmt.Printf("%s\n", providerOrDefault(cfg.LLMProvider))
+			case "llm_api_key":
+				fmt.Printf("%s\n", maskKey(cfg.LLMAPIKey))
+			case "llm_model":
+				fmt.Printf("%s\n", cfg.LLMModel)
 			default:
-				return fmt.Errorf("unknown config key %q\nValid keys: autonomy_level, approval_timeout_foreground, approval_timeout_background, voice_enabled, voice_push_to_talk_key, whisper_model_path", key)
+				return fmt.Errorf("unknown config key %q\nValid keys: autonomy_level, approval_timeout_foreground, approval_timeout_background, voice_enabled, voice_push_to_talk_key, whisper_model_path, llm_provider, llm_api_key, llm_model", key)
 			}
 			return nil
 		},
 	}
+}
+
+// providerOrDefault returns the configured provider name, defaulting to
+// config.ProviderAnthropic when unset (fresh configs created before this
+// field existed).
+func providerOrDefault(p string) string {
+	if p == "" {
+		return config.ProviderAnthropic
+	}
+	return p
+}
+
+// maskKey returns a masked preview of a secret for display purposes so
+// 'hyperi config get llm_api_key' doesn't dump the raw key to the terminal.
+func maskKey(key string) string {
+	if key == "" {
+		return "(unset — using provider default env var)"
+	}
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "..." + key[len(key)-4:]
 }
 
 func buildConfigSetCmd() *cobra.Command {
@@ -614,6 +647,21 @@ func buildConfigSetCmd() *cobra.Command {
 			case "whisper_model_path":
 				cfg.WhisperModelPath = val
 				fmt.Printf("whisper_model_path set to %q\n", val)
+			case "llm_provider":
+				switch val {
+				case config.ProviderAnthropic, config.ProviderOpenCodeZen:
+					cfg.LLMProvider = val
+				default:
+					return fmt.Errorf("llm_provider must be %q or %q, got %q",
+						config.ProviderAnthropic, config.ProviderOpenCodeZen, val)
+				}
+				fmt.Printf("llm_provider set to %q\n", cfg.LLMProvider)
+			case "llm_api_key":
+				cfg.LLMAPIKey = val
+				fmt.Printf("llm_api_key set (%s)\n", maskKey(cfg.LLMAPIKey))
+			case "llm_model":
+				cfg.LLMModel = val
+				fmt.Printf("llm_model set to %q\n", val)
 			default:
 				return fmt.Errorf("unknown config key %q", key)
 			}
@@ -643,6 +691,9 @@ func buildConfigShowCmd() *cobra.Command {
 			fmt.Printf("  voice_push_to_talk_key      %s\n", cfg.VoicePushToTalkKey)
 			fmt.Printf("  whisper_model_path          %s\n", cfg.WhisperModelPath)
 			fmt.Printf("  whisper_cli_path            %s\n", cfg.WhisperCLIPath)
+			fmt.Printf("  llm_provider                %s\n", providerOrDefault(cfg.LLMProvider))
+			fmt.Printf("  llm_api_key                 %s\n", maskKey(cfg.LLMAPIKey))
+			fmt.Printf("  llm_model                   %s\n", cfg.LLMModel)
 			if !cfg.AutonomyUpdatedAt.IsZero() {
 				fmt.Printf("\n  autonomy last changed by %s at %s\n",
 					cfg.AutonomyUpdatedBy,
@@ -1040,7 +1091,7 @@ func runHeadless(cfg *config.Config, intent string, execute bool) error {
 		CachePath:     infra.dataPathFn("cache/plans.json"),
 		TemplatePath:  templatePath,
 		StatsPath:     infra.dataPathFn("cache/stats.json"),
-		Fallback:      func(intent, _ string) error { return pipelineRunner(intent, "") },
+		Fallback:      func(ctx context.Context, intent, _ string) error { return pipelineRunner(ctx, intent, "") },
 		Registry:      infra.registry,
 		Validator:     infra.validator,
 		Notifier:      infra.notifier,
@@ -1171,6 +1222,23 @@ func loadConfig(path string) (*config.Config, error) {
 		path = defaultConfigPath()
 	}
 	return config.Load(path)
+}
+
+// resolveAPIKey returns the API key to use for cfg.LLMProvider.
+// cfg.LLMAPIKey (set via 'hyperi config set llm_api_key ...') takes
+// precedence; otherwise fall back to the env var for whichever provider is
+// configured. This lets a user with an exhausted ANTHROPIC_API_KEY switch to
+// OpenCode Zen without unsetting anything.
+func resolveAPIKey(cfg *config.Config) string {
+	if cfg.LLMAPIKey != "" {
+		return cfg.LLMAPIKey
+	}
+	switch cfg.LLMProvider {
+	case config.ProviderOpenCodeZen:
+		return os.Getenv("OPENCODE_API_KEY")
+	default:
+		return os.Getenv("ANTHROPIC_API_KEY")
+	}
 }
 
 // ── Misc utilities ────────────────────────────────────────────────────────────

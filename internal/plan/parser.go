@@ -20,21 +20,22 @@ type StageStatus struct {
 
 // StepState represents the execution state of a single action step.
 type StepState struct {
-	StepID    string
-	Status    string // "in-progress", "completed", "skipped", "halted", "pending"
-	Result    string // "success", "failure", "skipped", ""
-	OnFailure string
+	StepID     string
+	Status     string // "in-progress", "completed", "skipped", "halted", "pending"
+	Result     string // "success", "failure", "skipped", ""
+	OnFailure  string
 	DurationMS string
 }
 
 // PlanState is the parsed state of a plan document.
 // Used by crash recovery and resume logic.
 type PlanState struct {
-	SessionID    string
-	Status       string // document-level status from frontmatter
-	Attempt      int
-	Stages       map[string]StageStatus
-	Steps        map[string]StepState
+	SessionID       string
+	Name            string // human-readable plan name from frontmatter (set once the plan stage completes)
+	Status          string // document-level status from frontmatter
+	Attempt         int
+	Stages          map[string]StageStatus
+	Steps           map[string]StepState
 	PendingApproval string
 
 	// Deserialized LLM outputs — populated from the "result" field of each
@@ -74,6 +75,10 @@ func ParsePlanDoc(path string) (*PlanState, error) {
 		// Parse frontmatter fields (lines before the first ## heading)
 		if strings.HasPrefix(line, "Session: ") {
 			state.SessionID = strings.TrimPrefix(line, "Session: ")
+			continue
+		}
+		if strings.HasPrefix(line, "Plan: ") {
+			state.Name = strings.TrimPrefix(line, "Plan: ")
 			continue
 		}
 		if strings.HasPrefix(line, "Status: ") {

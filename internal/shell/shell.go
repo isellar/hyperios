@@ -21,9 +21,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/isellar/hyperios/internal/audit"
+	cfg "github.com/isellar/hyperios/internal/config"
 	"github.com/isellar/hyperios/internal/events"
 	"github.com/isellar/hyperios/internal/governor/capability"
-	cfg "github.com/isellar/hyperios/internal/config"
 	"github.com/isellar/hyperios/internal/manifest"
 	"github.com/isellar/hyperios/internal/plan"
 	"github.com/isellar/hyperios/internal/router"
@@ -134,7 +134,7 @@ func (s *Shell) Run() error {
 			}
 		},
 	}
-	model := New(s.notifier, runner, notifications, s.workDir, vc, ac)
+	model := New(s.notifier, runner, notifications, s.workDir, s.dataPathFn("plans"), vc, ac)
 
 	// Run bubbletea.
 	// WithMouseCellMotion is intentionally omitted: enabling bubbletea mouse
@@ -253,7 +253,7 @@ func wrapWithRouter(fallback PipelineRunner, s *Shell) PipelineRunner {
 		CachePath:     s.dataPathFn("cache/plans.json"),
 		TemplatePath:  templatePath,
 		StatsPath:     s.dataPathFn("cache/stats.json"),
-		Fallback:      func(intent, _ string) error { return fallback(intent, "") },
+		Fallback:      func(ctx context.Context, intent, _ string) error { return fallback(ctx, intent, "") },
 		Registry:      s.registry,
 		Validator:     s.validator,
 		Notifier:      s.notifier,
@@ -262,11 +262,11 @@ func wrapWithRouter(fallback PipelineRunner, s *Shell) PipelineRunner {
 		WorkspaceDir:  s.workDir,
 	})
 
-	return func(intent, sessionID string) error {
+	return func(ctx context.Context, intent, sessionID string) error {
 		if strings.HasPrefix(intent, resumePrefix) {
-			return fallback(intent, sessionID)
+			return fallback(ctx, intent, sessionID)
 		}
-		return ir.Route(context.Background(), intent)
+		return ir.Route(ctx, intent)
 	}
 }
 
@@ -283,4 +283,3 @@ func findTemplates(dataPathFn func(string) string) string {
 	}
 	return ""
 }
-

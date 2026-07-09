@@ -10,29 +10,30 @@ import (
 	"strings"
 	"time"
 
-	"github.com/isellar/hyperios/internal/governor"
-	"github.com/isellar/hyperios/internal/events"
 	"github.com/isellar/hyperios/internal/cache"
+	"github.com/isellar/hyperios/internal/events"
+	"github.com/isellar/hyperios/internal/governor"
 	"github.com/isellar/hyperios/internal/governor/capability"
 	"github.com/isellar/hyperios/internal/governor/executor"
 	"github.com/isellar/hyperios/internal/types"
 )
 
-// PipelineRunner is the signature for the full pipeline fallback.
-type PipelineRunner func(intent, workspaceDir string) error
+// PipelineRunner is the signature for the full pipeline fallback. The context
+// is caller-owned and may be cancelled to abort the pipeline mid-run.
+type PipelineRunner func(ctx context.Context, intent, workspaceDir string) error
 
 // Config holds IntentRouter configuration.
 type Config struct {
-	CachePath    string
-	TemplatePath string
-	StatsPath    string
-	Fallback     PipelineRunner
-	Registry     *capability.Registry
-	Validator    *capability.CommandValidator
-	Notifier     *events.Notifier
-	SessionID    string
+	CachePath     string
+	TemplatePath  string
+	StatsPath     string
+	Fallback      PipelineRunner
+	Registry      *capability.Registry
+	Validator     *capability.CommandValidator
+	Notifier      *events.Notifier
+	SessionID     string
 	AutonomyLevel int
-	WorkspaceDir string
+	WorkspaceDir  string
 }
 
 // IntentRouter routes intents to the fastest appropriate execution path.
@@ -96,7 +97,7 @@ func (r *IntentRouter) executeNovel(ctx context.Context, intent string, start ti
 		return fmt.Errorf("no fallback pipeline configured")
 	}
 
-	err := r.fallback(intent, r.cfg.WorkspaceDir)
+	err := r.fallback(ctx, intent, r.cfg.WorkspaceDir)
 	duration := time.Since(start)
 
 	if err == nil {

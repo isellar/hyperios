@@ -31,6 +31,16 @@ const (
 	AutonomyTrusted = 4
 )
 
+// LLM provider identifiers for LLMProvider.
+const (
+	// ProviderAnthropic talks directly to api.anthropic.com using ANTHROPIC_API_KEY.
+	ProviderAnthropic = "anthropic"
+	// ProviderOpenCodeZen routes through OpenCode Zen (opencode.ai/zen), an
+	// Anthropic-messages-compatible gateway to many models. Useful as a
+	// fallback when the Anthropic account is out of quota/tokens.
+	ProviderOpenCodeZen = "opencode-zen"
+)
+
 // Config is the global runtime configuration for HyperiOS.
 type Config struct {
 	// AutonomyLevel controls when the agent acts without asking.
@@ -97,13 +107,19 @@ type Config struct {
 	// Default: 5
 	MaxAgentSpawnLimit int `json:"max_agent_spawn_limit,omitempty"`
 
-	// LLMProvider is the model provider to use (e.g. "anthropic", "openai").
+	// LLMProvider is the model provider to use. One of ProviderAnthropic
+	// (default) or ProviderOpenCodeZen.
 	// Default: "anthropic"
 	LLMProvider string `json:"llm_provider,omitempty"`
 
 	// LLMModel is the model identifier (e.g. "claude-sonnet-4-20250514").
 	// Default: "" (uses provider default)
 	LLMModel string `json:"llm_model,omitempty"`
+
+	// LLMAPIKey overrides the provider's default env-var-sourced API key.
+	// For "anthropic" this overrides ANTHROPIC_API_KEY; for "opencode-zen"
+	// this is the Zen API key (falls back to OPENCODE_API_KEY env var).
+	LLMAPIKey string `json:"llm_api_key,omitempty"`
 }
 
 // GeneratorConfig controls the self-improvement template generator.
@@ -147,13 +163,13 @@ func Defaults() *Config {
 		DirectivesImmutablePath: "/etc/hyperi/directives-immutable.yaml",
 		DirectivesMutablePath:   "/var/lib/hyperi/directives-mutable.yaml",
 		// Storage paths
-		GoalStoragePath:    "/var/lib/hyperi/goals.json",
-		MemoryStoragePath:  "/var/lib/hyperi/memory",
+		GoalStoragePath:     "/var/lib/hyperi/goals.json",
+		MemoryStoragePath:   "/var/lib/hyperi/memory",
 		ToolAuthStoragePath: "/var/lib/hyperi/tool_auth.json",
 		// Agent limits
 		MaxAgentSpawnLimit: 5,
 		// LLM provider
-		LLMProvider: "anthropic",
+		LLMProvider: ProviderAnthropic,
 		LLMModel:    "",
 	}
 }

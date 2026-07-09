@@ -94,6 +94,42 @@ func (w *Writer) Path() string {
 	return w.path
 }
 
+// WritePlanName updates the frontmatter to include the human-readable plan name.
+func (w *Writer) WritePlanName(name string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if name == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(w.path)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	// Insert Plan: line after the Task: line if not already present.
+	var out []string
+	var inserted bool
+	for _, line := range lines {
+		if !inserted && strings.HasPrefix(line, "# Task: ") {
+			out = append(out, line)
+			out = append(out, "Plan: "+name)
+			inserted = true
+			continue
+		}
+		if strings.HasPrefix(line, "Plan: ") {
+			out = append(out, "Plan: "+name)
+			inserted = true
+			continue
+		}
+		out = append(out, line)
+	}
+
+	return os.WriteFile(w.path, []byte(strings.Join(out, "\n")), 0o640)
+}
+
 // WriteStageStart appends a stage section header with status: in-progress.
 // The stage name becomes a markdown heading and a hyperi-meta block is opened.
 func (w *Writer) WriteStageStart(stage string) error {

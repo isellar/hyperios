@@ -19,23 +19,25 @@ type Guard struct {
 
 // CachedPlan stores a successful intent→plan mapping with metadata.
 type CachedPlan struct {
-	Intent      string             `json:"intent"`
-	Plan        *types.ActionPlan  `json:"plan"`
-	Hits        int                `json:"hits"`
-	LastUsed    time.Time          `json:"last_used"`
-	SuccessRate float64            `json:"success_rate"`
-	TotalExecs  int                `json:"total_execs"`
-	Guards      []Guard            `json:"-"`
-	guardDescs  []string           `json:"guards,omitempty"`
+	Intent      string            `json:"intent"`
+	Plan        *types.ActionPlan `json:"plan"`
+	Hits        int               `json:"hits"`
+	LastUsed    time.Time         `json:"last_used"`
+	SuccessRate float64           `json:"success_rate"`
+	TotalExecs  int               `json:"total_execs"`
+	Guards      []Guard           `json:"-"`
+	// guardDescs is unexported and therefore never marshaled by encoding/json;
+	// it exists purely as an in-memory cache of Guard.Description strings.
+	guardDescs []string
 }
 
 // PlanCache stores and retrieves cached intent→plan mappings.
 type PlanCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*CachedPlan
-	path     string
-	maxSize  int
-	ttl      time.Duration
+	mu      sync.RWMutex
+	entries map[string]*CachedPlan
+	path    string
+	maxSize int
+	ttl     time.Duration
 }
 
 // Config holds PlanCache configuration.

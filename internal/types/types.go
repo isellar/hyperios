@@ -64,11 +64,11 @@ type ActionStep struct {
 	// Capability.Scope contains the binary name (for allowlist matching).
 	// For execute:config: Command[0]=path, Command[1]=content.
 	// For network:outbound: Command[0]=method, Command[1]=url, Command[2]=body (optional).
-	Command     []string   `json:"command,omitempty"`
-	Reversible  bool       `json:"reversible"`
-	DependsOn   []string   `json:"depends_on"`
+	Command    []string `json:"command,omitempty"`
+	Reversible bool     `json:"reversible"`
+	DependsOn  []string `json:"depends_on"`
 	// Failure policy — specified by the Planner, enforced by the Executor.
-	OnFailure           string `json:"on_failure,omitempty"`           // "halt" | "retry" | "replan" | "skip"
+	OnFailure           string `json:"on_failure,omitempty"`            // "halt" | "retry" | "replan" | "skip"
 	MaxRetries          int    `json:"max_retries,omitempty"`           // used when OnFailure == "retry"
 	RetryBackoffSeconds int    `json:"retry_backoff_seconds,omitempty"` // seconds between retries
 
@@ -88,8 +88,8 @@ type ReadyCondition struct {
 	// "atspi:present"  — AT-SPI element present (Phase 4, stubbed)
 	// "vision:confirms"— LLM vision confirms screen state (Phase 4, stubbed)
 	Type                string `json:"type"`
-	Target              string `json:"target"`               // service name, file path, URL, substring, etc.
-	TimeoutSeconds      int    `json:"timeout_seconds"`      // fail step if condition not met within this window
+	Target              string `json:"target"`                // service name, file path, URL, substring, etc.
+	TimeoutSeconds      int    `json:"timeout_seconds"`       // fail step if condition not met within this window
 	PollIntervalSeconds int    `json:"poll_interval_seconds"` // how often to re-check (default 2s)
 }
 
@@ -110,7 +110,7 @@ type RiskReport struct {
 // ArbiterVerdict is the Policy Arbiter's decision for a single step.
 type ArbiterVerdict struct {
 	StepID   string `json:"step_id"`
-	Verdict  string `json:"verdict"`  // "approved", "modified", "blocked"
+	Verdict  string `json:"verdict"` // "approved", "modified", "blocked"
 	Reason   string `json:"reason"`
 	Autonomy int    `json:"autonomy"` // autonomy level at which verdict was evaluated
 }
@@ -143,6 +143,10 @@ const (
 
 // ActionPlan is the structured output of the Planner Agent.
 type ActionPlan struct {
+	// Name is a short human-readable label for the plan (e.g. "Install and
+	// start nginx web server"), surfaced in plan doc frontmatter and the
+	// 'hyperi plans' / in-shell 'plans' listings instead of the raw session ID.
+	Name     string       `json:"name,omitempty"`
 	Executor ExecutorType `json:"executor,omitempty"`
 	Steps    []ActionStep `json:"steps"`
 }
