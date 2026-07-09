@@ -86,6 +86,22 @@ just build                          # Cross-compile: linux/amd64, linux/arm64
 Target platforms: **Linux only** (amd64 primary, arm64 for ARM laptops/RPi).
 This is a Linux distribution — Windows/macOS are not supported targets.
 
+## CI / Auto-push Policy
+
+Every push and PR runs `.github/workflows/ci.yml` (`go vet`, `go build`,
+`go test -race ./...`) as the required gate — do not merge/push changes that
+fail it.
+
+Locally, run `just hooks-install` once per clone to enable a `post-commit`
+git hook (`scripts/hooks/post-commit`) that runs `go test -race ./...` after
+every commit and pushes to the branch's upstream automatically **only if
+tests pass**. If tests fail, nothing is pushed — fix and commit again.
+Set `HYPERIOS_SKIP_AUTOPUSH=1` to skip auto-push for a single commit (e.g.
+WIP commits you don't want published yet).
+
+Net effect: any commit that passes tests locally is expected to end up on
+origin without a separate manual push step.
+
 ## Known Bugs
 
 1. Glob matching in `registry.Check()` needs end-to-end testing on Linux paths

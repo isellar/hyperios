@@ -1,0 +1,43 @@
+#!/bin/sh
+# post-commit hook: run the test suite after every commit, and push to the
+# current branch's upstream automatically if (and only if) tests pass.
+#
+# Installed via 'core.hooksPath = scripts/hooks' (see scripts/hooks/install.sh
+# or 'just hooks-install'). This is intentionally opt-in per clone — hooks
+# aren't cloned by git, so a fresh checkout must run the installer once.
+#
+# Skip conditions (no push attempted):
+#   - HYPERIOS_SKIP_AUTOPUSH=1 is set in the environment
+#   - the branch has no upstream configured (nothing to push to)
+#   - `go test` fails
+set -eu
+
+if [ "${HYPERIOS_SKIP_AUTOPUSH:-}" = "1" ]; then
+    exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+echo "post-commit: running tests before auto-push..."
+if ! go test -race ./... ; then
+    echo "post-commit: tests FAILED — not pushing. Fix and commit again, or push manually once green." >&2
+    exit 0
+fi
+
+if ! git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
+    echo "post-commit: tests passed, but '$branch' has no upstream configured — skipping push."
+    echo "  Run: git push -u origin $branch"
+    exit 0
+fi
+
+echo "post-commit: tests passed — pushing $branch..."
+if git push; then
+    echo "post-commit: pushed $branch to origin."
+else
+    echo "post-commit: push failed (see above) — push manually once resolved." >&2
+fi
+
+exit 0

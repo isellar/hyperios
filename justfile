@@ -6,6 +6,10 @@
 build-local:
     go build -o hyperi ./cmd/hyperi
 
+# Build and install to /usr/local/bin
+install: build-local
+    sudo cp hyperi /usr/local/bin/hyperi
+
 # Cross-compile for Linux targets (primary deployment targets)
 build:
     mkdir -p dist
@@ -35,6 +39,11 @@ fmt:
 # Tidy dependencies
 tidy:
     go mod tidy
+
+# Install repo git hooks (post-commit: run tests, auto-push to origin on
+# success). Run once per clone.
+hooks-install:
+    sh scripts/hooks/install.sh
 
 # ── Dev VM (Vagrant) ───────────────────────────────────────────────────────────
 

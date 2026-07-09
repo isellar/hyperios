@@ -1,0 +1,30 @@
+name: CI
+
+# Runs the unit test suite (and vet/build) on every push and PR so that any
+# change failing tests is caught before it reaches origin. Integration tests
+# that require an Anthropic API key are intentionally excluded — they run
+# with the 'integration' build tag and aren't part of the required CI gate.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.6"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race ./...
