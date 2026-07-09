@@ -40,6 +40,11 @@ fmt:
 tidy:
     go mod tidy
 
+# Install repo git hooks (post-commit: run tests, auto-push to origin on
+# success). Run once per clone.
+hooks-install:
+    sh scripts/hooks/install.sh
+
 # ── Dev VM (Vagrant) ───────────────────────────────────────────────────────────
 
 # Spin up dev VM (Ubuntu 24.04, headless sway, cloud-init provisioned)
