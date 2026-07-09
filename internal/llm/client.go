@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -12,7 +13,14 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
-const Model = anthropic.ModelClaudeSonnet4_6
+// DefaultModel is used when Options.Model is left empty.
+const DefaultModel = anthropic.ModelClaudeSonnet4_6
+
+// ZenBaseURL is the OpenCode Zen API endpoint. Zen exposes an
+// Anthropic-messages-compatible API at this base URL, authenticated the same
+// way as Anthropic's own API (X-Api-Key header), which is what
+// option.WithAPIKey sends. See https://opencode.ai/docs/zen/
+const ZenBaseURL = "https://opencode.ai/zen"
 
 // Error types for stage-level retry decisions.
 
@@ -50,17 +58,84 @@ func (e *MalformedResponseError) Error() string {
 // Client wraps the Anthropic SDK for simple prompt→JSON calls.
 type Client struct {
 	inner *anthropic.Client
+	model anthropic.Model
 }
 
-// NewClient creates an Anthropic client. API key is read from ANTHROPIC_API_KEY
-// env var by the SDK automatically; pass an explicit key to override.
+// Options configures NewClientWithOptions. Zero values fall back to the
+// original Anthropic-direct behavior (APIKey via ANTHROPIC_API_KEY, model
+// DefaultModel, api.anthropic.com base URL).
+type Options struct {
+	// APIKey authenticates the request. For the "anthropic" provider this is
+	// the ANTHROPIC_API_KEY value; for "opencode-zen" this is the Zen API key
+	// (see opencode.ai/auth). Sent as the X-Api-Key header either way.
+	APIKey string
+	// BaseURL overrides the API endpoint. Empty means api.anthropic.com.
+	BaseURL string
+	// Model overrides DefaultModel. For OpenCode Zen, use one of the model
+	// IDs from https://opencode.ai/zen/v1/models (e.g. "claude-sonnet-5").
+	Model string
+}
+
+// NewClient creates an Anthropic client talking directly to api.anthropic.com.
+// API key is read from ANTHROPIC_API_KEY env var by the SDK automatically;
+// pass an explicit key to override.
 func NewClient(apiKey string) *Client {
+	return NewClientWithOptions(Options{APIKey: apiKey})
+}
+
+// NewClientWithOptions creates a Client against an arbitrary Anthropic-messages-
+// compatible endpoint. Use this to route through OpenCode Zen (ZenBaseURL) or
+// any other compatible proxy by setting BaseURL and APIKey.
+func NewClientWithOptions(o Options) *Client {
 	opts := []option.RequestOption{}
-	if apiKey != "" {
-		opts = append(opts, option.WithAPIKey(apiKey))
+	if o.APIKey != "" {
+		opts = append(opts, option.WithAPIKey(o.APIKey))
+	}
+	if o.BaseURL != "" {
+		opts = append(opts, option.WithBaseURL(o.BaseURL))
+	}
+	model := anthropic.Model(o.Model)
+	if model == "" {
+		model = DefaultModel
 	}
 	c := anthropic.NewClient(opts...)
-	return &Client{inner: &c}
+	return &Client{inner: &c, model: model}
+}
+
+// DefaultZenModel is the OpenCode Zen model ID used when no override is set.
+// See https://opencode.ai/zen/v1/models for the full catalog.
+const DefaultZenModel = "claude-sonnet-5"
+
+// NewClientForProvider builds a Client for the named provider ("anthropic" or
+// "opencode-zen"). apiKey and model, if non-empty, override the provider's
+// defaults; otherwise sane env-var fallbacks are used:
+//   - "anthropic":    ANTHROPIC_API_KEY, model DefaultModel
+//   - "opencode-zen": OPENCODE_API_KEY, model DefaultZenModel, base ZenBaseURL
+//
+// An unknown/empty provider is treated as "anthropic".
+func NewClientForProvider(provider, apiKey, model string) *Client {
+	switch provider {
+	case "opencode-zen":
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENCODE_API_KEY")
+		}
+		if model == "" {
+			model = DefaultZenModel
+		}
+		return NewClientWithOptions(Options{
+			APIKey:  apiKey,
+			BaseURL: ZenBaseURL,
+			Model:   model,
+		})
+	default:
+		if apiKey == "" {
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		}
+		return NewClientWithOptions(Options{
+			APIKey: apiKey,
+			Model:  model,
+		})
+	}
 }
 
 // Complete sends a system + user prompt and returns the raw text response.
@@ -71,8 +146,8 @@ func NewClient(apiKey string) *Client {
 //   - MalformedResponseError: caller should retry up to 2 times; if still malformed, halt
 func (c *Client) Complete(ctx context.Context, system, user string) (string, error) {
 	msg, err := c.inner.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     Model,
-		MaxTokens: 4096,
+		Model:     c.model,
+		MaxTokens: 16384,
 		System: []anthropic.TextBlockParam{
 			{Text: system},
 		},
@@ -86,6 +161,16 @@ func (c *Client) Complete(ctx context.Context, system, user string) (string, err
 	if len(msg.Content) == 0 {
 		return "", &NetworkError{Cause: fmt.Errorf("empty response from model")}
 	}
+
+	// Detect truncation — if the model hit max_tokens, the output is likely
+	// incomplete JSON that will fail to parse. Surface a clear error so the
+	// caller can retry or the user sees what happened.
+	if msg.StopReason == anthropic.StopReasonMaxTokens {
+		return "", &MalformedResponseError{
+			Raw: "response truncated at max_tokens — plan may be too large; consider fewer steps",
+		}
+	}
+
 	var sb strings.Builder
 	for _, block := range msg.Content {
 		if block.Type == "text" {
@@ -99,7 +184,7 @@ func (c *Client) Complete(ctx context.Context, system, user string) (string, err
 // It is the preferred entry point for all pipeline stage LLM calls.
 func (c *Client) CompleteWithRetry(ctx context.Context, system, user string) (string, error) {
 	const (
-		maxNetworkRetries  = 3
+		maxNetworkRetries   = 3
 		maxRateLimitRetries = 5
 		maxMalformedRetries = 2
 	)

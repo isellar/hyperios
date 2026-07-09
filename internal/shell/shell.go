@@ -46,6 +46,8 @@ type Shell struct {
 
 // Config holds Shell dependencies.
 type Config struct {
+	// APIKey authenticates against whichever LLM provider is configured via
+	// HypConfig.LLMProvider (see config.ProviderAnthropic / ProviderOpenCodeZen).
 	APIKey        string
 	HypConfig     *cfg.Config
 	ConfigPath    string // path to persist config changes
@@ -100,6 +102,8 @@ func (s *Shell) Run() error {
 	// Build pipeline runner
 	runner := NewPipelineRunner(RunnerConfig{
 		APIKey:        s.apiKey,
+		Provider:      s.config.LLMProvider,
+		ProviderModel: s.config.LLMModel,
 		AutonomyLevel: s.config.AutonomyLevel,
 		ExecutorType:  "local",
 		EventBus:      s.eventBus,
@@ -130,7 +134,7 @@ func (s *Shell) Run() error {
 			}
 		},
 	}
-	model := New(s.eventBus, runner, notifications, s.workDir, vc, ac)
+	model := New(s.eventBus, runner, notifications, s.workDir, s.dataPathFn("plans"), vc, ac)
 
 	// Run bubbletea.
 	// WithMouseCellMotion is intentionally omitted: enabling bubbletea mouse

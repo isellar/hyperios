@@ -91,6 +91,7 @@ RULES:
 Return ONLY valid JSON — no markdown fences, no explanation, no text before or after:
 
 {
+  "name": "Install and start nginx web server",
   "executor": "local",
   "steps": [
     {

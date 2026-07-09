@@ -6,6 +6,10 @@
 build-local:
     go build -o hyperi ./cmd/hyperi
 
+# Build and install to /usr/local/bin
+install: build-local
+    sudo cp hyperi /usr/local/bin/hyperi
+
 # Cross-compile for Linux targets (primary deployment targets)
 build:
     mkdir -p dist

@@ -78,6 +78,9 @@ func (s *Stub) Present(plan *types.ActionPlan, verdicts []types.ArbiterVerdict, 
 	}
 
 	fmt.Fprintln(s.out, "\n-- Proposed Action Plan -----------------------------------------------")
+	if plan.Name != "" {
+		fmt.Fprintf(s.out, "Name: %s\n\n", plan.Name)
+	}
 	for i, step := range plan.Steps {
 		v := verdictMap[step.ID]
 		icon := verdictIcon(v.Verdict)

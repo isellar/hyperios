@@ -31,11 +31,33 @@ const (
 	AutonomyTrusted = 4
 )
 
+// LLM provider identifiers.
+const (
+	// ProviderAnthropic talks directly to api.anthropic.com using ANTHROPIC_API_KEY.
+	ProviderAnthropic = "anthropic"
+	// ProviderOpenCodeZen routes through OpenCode Zen (opencode.ai/zen), an
+	// Anthropic-messages-compatible gateway to many models. Useful as a
+	// fallback when the Anthropic account is out of quota/tokens.
+	ProviderOpenCodeZen = "opencode-zen"
+)
+
 // Config is the global runtime configuration for HyperiOS.
 type Config struct {
 	// AutonomyLevel controls when the agent acts without asking.
 	// Default: 1 (execute approved steps; modified verdicts require user approval).
 	AutonomyLevel int `json:"autonomy_level"`
+
+	// LLMProvider selects which backend the agent pipeline talks to.
+	// One of ProviderAnthropic (default) or ProviderOpenCodeZen.
+	LLMProvider string `json:"llm_provider,omitempty"`
+
+	// LLMAPIKey overrides the provider's default env-var-sourced API key.
+	// For "anthropic" this overrides ANTHROPIC_API_KEY; for "opencode-zen"
+	// this is the Zen API key (falls back to OPENCODE_API_KEY env var).
+	LLMAPIKey string `json:"llm_api_key,omitempty"`
+
+	// LLMModel overrides the default model ID for the selected provider.
+	LLMModel string `json:"llm_model,omitempty"`
 
 	// ApprovalTimeoutForeground is how long to wait for user approval in a
 	// foreground (interactive) session before halting.
@@ -75,6 +97,7 @@ type Config struct {
 func Defaults() *Config {
 	return &Config{
 		AutonomyLevel:             AutonomyApproved,
+		LLMProvider:               ProviderAnthropic,
 		ApprovalTimeoutForeground: 300, // 5 minutes
 		ApprovalTimeoutBackground: 30,  // 30 seconds
 		WatchPaths: []string{

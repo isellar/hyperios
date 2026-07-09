@@ -29,7 +29,17 @@ const maxReplans = 2
 
 // RunnerConfig holds all dependencies the pipeline runner needs.
 type RunnerConfig struct {
-	APIKey        string
+	// APIKey authenticates against whichever Provider is selected:
+	//   - "anthropic" (default): ANTHROPIC_API_KEY value
+	//   - "opencode-zen":        OpenCode Zen API key (opencode.ai/auth)
+	// Empty falls back to the provider's default env var
+	// (ANTHROPIC_API_KEY / OPENCODE_API_KEY respectively).
+	APIKey string
+	// Provider selects the LLM backend: "anthropic" (default) or
+	// "opencode-zen". See config.ProviderAnthropic / config.ProviderOpenCodeZen.
+	Provider string
+	// ProviderModel overrides the default model ID for the selected provider.
+	ProviderModel string
 	AutonomyLevel int
 	ExecutorType  string
 	EventBus      *bus.Bus
@@ -46,12 +56,12 @@ type RunnerConfig struct {
 // NewPipelineRunner returns a PipelineRunner closure suitable for use by the TUI.
 // Each call to the returned function runs the full agent pipeline for one intent.
 func NewPipelineRunner(rc RunnerConfig) PipelineRunner {
-	return func(intent, _ string) error {
+	return func(ctx context.Context, intent, _ string) error {
 		sessionID := uuid.New().String()[:8]
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		defer cancel()
 
-		client := llm.NewClient(rc.APIKey)
+		client := llm.NewClientForProvider(rc.Provider, rc.APIKey, rc.ProviderModel)
 		ws := gatherWorkspaceContext(rc.WorkspaceDir)
 
 		// Create plan document
@@ -144,6 +154,7 @@ func runPipeline(ctx context.Context, a pipelineArgs) error {
 		pub(bus.EventPlanFailed, err.Error())
 		return err
 	}
+	_ = a.planWriter.WritePlanName(agentPlan.Name)
 	_ = a.planWriter.WriteStageComplete("plan", marshalJSON(agentPlan), "hyperi-plan")
 	_ = a.logger.Log(a.sessionID, "planner", graph, agentPlan)
 	a.state.Plan = agentPlan

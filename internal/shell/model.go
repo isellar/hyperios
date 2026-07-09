@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/isellar/hyperios/internal/bus"
+	"github.com/isellar/hyperios/internal/plan"
 	"github.com/isellar/hyperios/internal/types"
 	"github.com/isellar/hyperios/internal/voice"
 )
@@ -84,10 +87,11 @@ type Model struct {
 	lines    []outputLine
 
 	// Pipeline state
-	running   bool
-	sessionID string
-	runCount  int
-	planShown bool // true after the first plan:verdicts event; suppresses re-plan duplicates
+	running        bool
+	sessionID      string
+	runCount       int
+	planShown      bool               // true after the first plan:verdicts event; suppresses re-plan duplicates
+	pipelineCancel context.CancelFunc // cancels the running pipeline context
 
 	// Approval prompt state
 	approval    *approvalRequestMsg
@@ -105,6 +109,7 @@ type Model struct {
 
 	// Context for the foreground session (workspace dir, etc.)
 	workspaceDir string
+	plansDir     string
 
 	// Voice (push-to-talk)
 	voiceEnabled   bool
@@ -121,8 +126,9 @@ type Model struct {
 
 // PipelineRunner is the function the TUI calls when the user submits an intent.
 // It runs in a goroutine and sends events to the bus; the TUI receives them
-// via the bus subscription.
-type PipelineRunner func(intent string, sessionID string) error
+// via the bus subscription. The caller owns the context and can cancel it
+// (e.g. on ESC key) to abort the pipeline.
+type PipelineRunner func(ctx context.Context, intent string, sessionID string) error
 
 // VoiceConfig holds push-to-talk configuration for the TUI.
 type VoiceConfig struct {
@@ -141,7 +147,7 @@ type AutonomyConfig struct {
 }
 
 // New creates a new TUI Model.
-func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, workspaceDir string, vc VoiceConfig, ac AutonomyConfig) Model {
+func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, workspaceDir string, plansDir string, vc VoiceConfig, ac AutonomyConfig) Model {
 	// Text input
 	ti := textinput.New()
 	ti.Placeholder = "what do you want to do?"
@@ -165,6 +171,7 @@ func New(eventBus *bus.Bus, runner PipelineRunner, notifications []string, works
 		runner:         runner,
 		notifications:  notifications,
 		workspaceDir:   workspaceDir,
+		plansDir:       plansDir,
 		histIdx:        -1,
 		voiceEnabled:   vc.Enabled && voice.IsAvailable(vc.ModelPath, vc.CLIPath),
 		voiceModelPath: vc.ModelPath,
@@ -223,7 +230,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
+			if m.running {
+				// Ctrl+C while running: cancel pipeline (not quit)
+				if m.pipelineCancel != nil {
+					m.pipelineCancel()
+					m.pipelineCancel = nil
+				}
+				m.appendLine(outputLine{text: "  ⏹ Cancelling...", style: styleError})
+				m.refreshViewport()
+				return m, nil
+			}
 			return m, tea.Quit
+
+		case "esc":
+			if m.approval != nil {
+				m.handleApprovalResponse(false)
+				return m, nil
+			}
+			if m.running && m.pipelineCancel != nil {
+				m.pipelineCancel()
+				m.pipelineCancel = nil
+				m.appendLine(outputLine{text: "  ⏹ Cancelling...", style: styleError})
+				m.refreshViewport()
+				return m, nil
+			}
 
 		case "ctrl+space":
 			// Push-to-talk toggle: first press starts recording, second stops + transcribes
@@ -404,6 +434,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case pipelineDoneMsg:
 		m.running = false
+		m.pipelineCancel = nil
 		if msg.err != nil {
 			m.appendLine(outputLine{
 				text:  fmt.Sprintf("Error: %v", msg.err),
@@ -461,7 +492,7 @@ func (m Model) View() string {
 	} else if m.voiceRecording {
 		b.WriteString(styleApprovalPrompt.Render("🎤 Recording... press Ctrl+Space again to stop"))
 	} else if m.running {
-		b.WriteString(styleSystem.Render(promptStr() + " (running...)"))
+		b.WriteString(styleSystem.Render(promptStr() + " (running... Ctrl+C or Esc to cancel)"))
 	} else {
 		b.WriteString(stylePrompt.Render(promptStr()))
 		b.WriteString(m.input.View())
@@ -530,6 +561,12 @@ func (m *Model) handleInput() tea.Cmd {
 
 	// Built-in commands
 	lower := strings.ToLower(val)
+	// Strip "hyperi " prefix so "hyperi plans" works same as "plans"
+	if strings.HasPrefix(lower, "hyperi ") {
+		lower = strings.TrimPrefix(lower, "hyperi ")
+		val = strings.TrimPrefix(val, "hyperi ")
+		val = strings.TrimPrefix(val, "Hyperi ")
+	}
 	switch {
 	case lower == "exit" || lower == "quit":
 		return tea.Quit
@@ -548,6 +585,15 @@ func (m *Model) handleInput() tea.Cmd {
 	case strings.HasPrefix(lower, "autonomy "):
 		arg := strings.TrimSpace(val[len("autonomy "):])
 		return m.handleAutonomySet(arg)
+	case lower == "plans":
+		m.appendPlans("")
+		m.refreshViewport()
+		return nil
+	case strings.HasPrefix(lower, "plans "):
+		arg := strings.TrimSpace(val[len("plans "):])
+		m.appendPlans(arg)
+		m.refreshViewport()
+		return nil
 	}
 
 	// Add to history
@@ -569,11 +615,13 @@ func (m *Model) handleInput() tea.Cmd {
 	intent := val
 	runner := m.runner
 	sessionID := m.sessionID
+	ctx, cancel := context.WithCancel(context.Background())
+	m.pipelineCancel = cancel
 
 	return tea.Batch(
 		func() tea.Msg { return pipelineStartMsg{intent: intent} },
 		func() tea.Msg {
-			err := runner(intent, sessionID)
+			err := runner(ctx, intent, sessionID)
 			return pipelineDoneMsg{err: err}
 		},
 	)
@@ -765,6 +813,8 @@ func (m *Model) appendHelp() {
 	m.appendLine(outputLine{text: "  help               show this help", style: styleOutput})
 	m.appendLine(outputLine{text: "  autonomy           show current autonomy level", style: styleOutput})
 	m.appendLine(outputLine{text: "  autonomy <0-4>     change autonomy level", style: styleOutput})
+	m.appendLine(outputLine{text: "  plans              list plan documents", style: styleOutput})
+	m.appendLine(outputLine{text: "  plans <status>     filter by status (in-progress|completed|failed|halted)", style: styleOutput})
 	m.appendLine(outputLine{text: "  exit / quit        exit the shell", style: styleOutput})
 	m.appendBlank()
 	m.appendLine(outputLine{text: "Autonomy levels:", style: stylePlanHeading})
@@ -778,11 +828,95 @@ func (m *Model) appendHelp() {
 	m.appendLine(outputLine{text: "  ↑ / ↓             navigate command history (at prompt)", style: styleOutput})
 	m.appendLine(outputLine{text: "  PgUp / PgDn       scroll output", style: styleOutput})
 	m.appendLine(outputLine{text: "  Home / End        jump to top / bottom of output", style: styleOutput})
-	m.appendLine(outputLine{text: "  Ctrl+C            exit", style: styleOutput})
+	m.appendLine(outputLine{text: "  Ctrl+C            exit / cancel running operation", style: styleOutput})
+	m.appendLine(outputLine{text: "  Esc               cancel running operation / deny approval", style: styleOutput})
 	m.appendBlank()
 	m.appendLine(outputLine{text: "Text selection: use your terminal's normal mouse selection to copy.", style: styleGray})
 	m.appendBlank()
 	m.appendLine(outputLine{text: "Anything else is sent to the agent pipeline as an intent.", style: styleSystem})
+	m.appendBlank()
+}
+
+func (m *Model) appendPlans(statusFilter string) {
+	if m.plansDir == "" {
+		m.appendLine(outputLine{text: "  Plans directory not configured.", style: styleError})
+		return
+	}
+
+	entries, err := os.ReadDir(m.plansDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			m.appendLine(outputLine{text: "  No plans found.", style: styleGray})
+			return
+		}
+		m.appendLine(outputLine{text: fmt.Sprintf("  Error reading plans: %v", err), style: styleError})
+		return
+	}
+
+	type planEntry struct {
+		name    string
+		status  string
+		session string
+		modTime time.Time
+	}
+
+	var plans []planEntry
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		path := filepath.Join(m.plansDir, entry.Name())
+		state, err := plan.ParsePlanDoc(path)
+		if err != nil {
+			continue
+		}
+		if statusFilter != "" && state.Status != statusFilter {
+			continue
+		}
+		info, _ := entry.Info()
+		mod := time.Time{}
+		if info != nil {
+			mod = info.ModTime()
+		}
+		plans = append(plans, planEntry{
+			name:    strings.TrimSuffix(entry.Name(), ".md"),
+			status:  state.Status,
+			session: state.SessionID,
+			modTime: mod,
+		})
+	}
+
+	if len(plans) == 0 {
+		if statusFilter != "" {
+			m.appendLine(outputLine{text: fmt.Sprintf("  No plans with status %q.", statusFilter), style: styleGray})
+		} else {
+			m.appendLine(outputLine{text: "  No plans found.", style: styleGray})
+		}
+		return
+	}
+
+	sort.Slice(plans, func(i, j int) bool {
+		return plans[i].modTime.After(plans[j].modTime)
+	})
+
+	m.appendBlank()
+	m.appendLine(outputLine{text: fmt.Sprintf("%-10s  %-12s  %-20s  %s", "SESSION", "STATUS", "UPDATED", "FILE"), style: stylePlanHeading})
+	m.appendLine(outputLine{text: strings.Repeat("─", 68), style: styleDivider})
+	for _, p := range plans {
+		statusStyle := styleOutput
+		switch p.status {
+		case "completed":
+			statusStyle = styleStepOk
+		case "failed", "halted":
+			statusStyle = styleStepFail
+		case "in-progress":
+			statusStyle = styleStepStarted
+		}
+		m.appendLine(outputLine{
+			text:  fmt.Sprintf("%-10s  %-12s  %-20s  %s", p.session, p.status, p.modTime.Format("2006-01-02 15:04:05"), p.name+".md"),
+			style: statusStyle,
+		})
+	}
 	m.appendBlank()
 }
 
