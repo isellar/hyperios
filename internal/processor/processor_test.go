@@ -1,11 +1,11 @@
 package processor
 
 import (
-	"errors"
+	"context"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/isellar/hyperios/internal/governor"
 	"github.com/isellar/hyperios/internal/memory"
 	"github.com/isellar/hyperios/internal/types"
 )
@@ -13,26 +13,6 @@ import (
 // ---------------------------------------------------------------------------
 // Mock implementations
 // ---------------------------------------------------------------------------
-
-type mockGovernor struct {
-	approved bool
-	reason   string
-	err      error
-}
-
-func (m *mockGovernor) ReviewGoal(goal *types.Goal) (*governor.ReviewResult, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	return &governor.ReviewResult{
-		Approved: m.approved,
-		Reason:   m.reason,
-	}, nil
-}
-
-func (m *mockGovernor) CheckToolAuthorized(toolID string) bool {
-	return m.approved
-}
 
 type mockGoalUpdater struct {
 	updates []struct {
@@ -51,7 +31,8 @@ func (m *mockGoalUpdater) UpdateGoalState(id string, state types.GoalState) erro
 }
 
 type mockMemory struct {
-	entries map[string]interface{}
+	entries    map[string]interface{}
+	directives []types.Directive
 }
 
 func (m *mockMemory) RecallContext(key string) (interface{}, bool) {
@@ -61,6 +42,30 @@ func (m *mockMemory) RecallContext(key string) (interface{}, bool) {
 
 func (m *mockMemory) SearchContext(query string) ([]*memory.MemoryEntry, error) {
 	return nil, nil
+}
+
+func (m *mockMemory) ListDirectives() ([]types.Directive, error) {
+	return m.directives, nil
+}
+
+// promptCapturingCompleter satisfies llm.Completer and records the last user
+// prompt it was given, so tests can assert on what was actually sent to the
+// model (e.g. that directives were included).
+type promptCapturingCompleter struct {
+	lastUser string
+	response string
+}
+
+func (c *promptCapturingCompleter) Complete(_ context.Context, _, user string) (string, error) {
+	c.lastUser = user
+	if c.response != "" {
+		return c.response, nil
+	}
+	return "done", nil
+}
+
+func (c *promptCapturingCompleter) CompleteWithRetry(ctx context.Context, system, user string) (string, error) {
+	return c.Complete(ctx, system, user)
 }
 
 // ---------------------------------------------------------------------------
@@ -226,9 +231,8 @@ func TestProcessor_QueueGoal_NilGoal(t *testing.T) {
 	}
 }
 
-func TestProcessor_QueueGoal_Approved(t *testing.T) {
+func TestProcessor_QueueGoal(t *testing.T) {
 	p := NewProcessor(nil, nil, nil)
-	p.SetGovernor(&mockGovernor{approved: true, reason: "all good"})
 
 	goal := makeGoal("g1", types.GoalStateActive, time.Now())
 	if err := p.QueueGoal(goal); err != nil {
@@ -239,50 +243,8 @@ func TestProcessor_QueueGoal_Approved(t *testing.T) {
 	}
 }
 
-func TestProcessor_QueueGoal_Rejected(t *testing.T) {
+func TestProcessor_QueueGoal_MultipleQueued(t *testing.T) {
 	p := NewProcessor(nil, nil, nil)
-	p.SetGovernor(&mockGovernor{approved: false, reason: "violates directive"})
-
-	goal := makeGoal("g1", types.GoalStateActive, time.Now())
-	err := p.QueueGoal(goal)
-	if err == nil {
-		t.Fatal("expected error when governor rejects goal")
-	}
-	if p.prioritizer.Len() != 0 {
-		t.Fatalf("rejected goal should not be queued, got len %d", p.prioritizer.Len())
-	}
-}
-
-func TestProcessor_QueueGoal_GovernorError(t *testing.T) {
-	p := NewProcessor(nil, nil, nil)
-	p.SetGovernor(&mockGovernor{err: errors.New("governor unavailable")})
-
-	goal := makeGoal("g1", types.GoalStateActive, time.Now())
-	err := p.QueueGoal(goal)
-	if err == nil {
-		t.Fatal("expected error when governor returns error")
-	}
-	if p.prioritizer.Len() != 0 {
-		t.Fatalf("goal should not be queued on governor error, got len %d", p.prioritizer.Len())
-	}
-}
-
-func TestProcessor_QueueGoal_NoGovernor(t *testing.T) {
-	// When no governor is wired, QueueGoal should succeed (skip review).
-	p := NewProcessor(nil, nil, nil)
-
-	goal := makeGoal("g1", types.GoalStateActive, time.Now())
-	if err := p.QueueGoal(goal); err != nil {
-		t.Fatalf("expected success with no governor, got: %v", err)
-	}
-	if p.prioritizer.Len() != 1 {
-		t.Fatalf("expected 1 queued goal, got %d", p.prioritizer.Len())
-	}
-}
-
-func TestProcessor_QueueGoal_MultipleApproved(t *testing.T) {
-	p := NewProcessor(nil, nil, nil)
-	p.SetGovernor(&mockGovernor{approved: true})
 
 	for i := 0; i < 5; i++ {
 		goal := makeGoal(
@@ -310,18 +272,8 @@ func TestProcessor_Name(t *testing.T) {
 	}
 }
 
-func TestProcessor_Health_Degraded_NoGovernor(t *testing.T) {
-	p := NewProcessor(nil, nil, nil)
-	h := p.Health()
-	if h.Status != "degraded" {
-		t.Fatalf("expected degraded without governor, got %s", h.Status)
-	}
-}
-
 func TestProcessor_Health_Degraded_NoGoalUpdater(t *testing.T) {
 	p := NewProcessor(nil, nil, nil)
-	p.SetGovernor(&mockGovernor{approved: true})
-	// Still no GoalUpdater
 	h := p.Health()
 	if h.Status != "degraded" {
 		t.Fatalf("expected degraded without goal updater, got %s", h.Status)
@@ -330,7 +282,6 @@ func TestProcessor_Health_Degraded_NoGoalUpdater(t *testing.T) {
 
 func TestProcessor_Health_Healthy(t *testing.T) {
 	p := NewProcessor(nil, nil, nil)
-	p.SetGovernor(&mockGovernor{approved: true})
 	p.SetGoalFulfillment(&mockGoalUpdater{})
 	h := p.Health()
 	if h.Status != "healthy" {
@@ -366,5 +317,65 @@ func TestProcessor_LookupInfo_WithMemory(t *testing.T) {
 	_, err := p.LookupInfo("key1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Directive wiring through RunNext
+// ---------------------------------------------------------------------------
+
+// TestProcessor_RunNext_PassesDirectivesToAgent verifies that directives
+// returned by MemoryQuerier.ListDirectives actually reach the LLM prompt
+// (via the narrative fallback path, since no toolbox is wired in this test).
+func TestProcessor_RunNext_PassesDirectivesToAgent(t *testing.T) {
+	completer := &promptCapturingCompleter{}
+	p := NewProcessor(nil, completer, nil)
+	p.SetGoalFulfillment(&mockGoalUpdater{})
+	p.SetMemory(&mockMemory{
+		directives: []types.Directive{
+			{ID: "d1", Priority: 5, Description: "always check disk space before writing large files"},
+		},
+	})
+
+	goal := makeGoal("g1", types.GoalStateActive, time.Now())
+	if err := p.QueueGoal(goal); err != nil {
+		t.Fatalf("QueueGoal: %v", err)
+	}
+
+	result, err := p.RunNext()
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	if !strings.Contains(completer.lastUser, "always check disk space before writing large files") {
+		t.Errorf("expected directive text in prompt sent to LLM, got:\n%s", completer.lastUser)
+	}
+}
+
+// TestProcessor_RunNext_NoDirectives_NoMemory verifies RunNext still works
+// (with an empty/nil directive list) when no memory is wired at all.
+func TestProcessor_RunNext_NoDirectives_NoMemory(t *testing.T) {
+	completer := &promptCapturingCompleter{}
+	p := NewProcessor(nil, completer, nil)
+	p.SetGoalFulfillment(&mockGoalUpdater{})
+	// No SetMemory call — p.memory stays nil.
+
+	goal := makeGoal("g1", types.GoalStateActive, time.Now())
+	if err := p.QueueGoal(goal); err != nil {
+		t.Fatalf("QueueGoal: %v", err)
+	}
+
+	result, err := p.RunNext()
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if strings.Contains(completer.lastUser, "Directives") {
+		t.Errorf("expected no directives section without wired memory, got:\n%s", completer.lastUser)
 	}
 }

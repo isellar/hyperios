@@ -95,6 +95,16 @@ type Config struct {
 	// Default: /var/lib/hyperi/goals.json
 	GoalStoragePath string `json:"goal_storage_path,omitempty"`
 
+	// AgentResultsStoragePath is the path to the persisted AgentResult store
+	// (one entry per goal, keyed by goal ID). Without this, results only
+	// ever lived in the apiserver's in-memory cache and vanished on every
+	// restart — meaning a blocked goal's failure reason (surfaced in the
+	// web UI's "Blocked" status chip) was unrecoverable once the process
+	// restarted. Default: /var/lib/hyperi/agent_results.json (same
+	// directory as GoalStoragePath, computed in cmd/hyperi/wiring.go if
+	// unset here).
+	AgentResultsStoragePath string `json:"agent_results_storage_path,omitempty"`
+
 	// MemoryStoragePath is the path to the agent memory storage directory.
 	// Default: /var/lib/hyperi/memory
 	MemoryStoragePath string `json:"memory_storage_path,omitempty"`
@@ -120,6 +130,92 @@ type Config struct {
 	// For "anthropic" this overrides ANTHROPIC_API_KEY; for "opencode-zen"
 	// this is the Zen API key (falls back to OPENCODE_API_KEY env var).
 	LLMAPIKey string `json:"llm_api_key,omitempty"`
+
+	// Local model configuration (see internal/localmodel). This is
+	// independent of LLMProvider/LLMModel above: when LocalModelEnabled is
+	// true, the agent tries the local Ollama model first for every call and
+	// falls back to the configured remote provider (LLMProvider/LLMModel)
+	// only on failure. LLMProvider/LLMModel are always the remote fallback,
+	// never disabled by enabling local mode.
+	//
+	// LocalModelEnabled is only ever set to true by an explicit, confirmed
+	// 'hyperi models setup' run (or 'hyperi models enable' after a prior
+	// setup) — never automatically — so pulling multi-GB models and
+	// switching inference behavior always requires the user's say-so.
+	// 'hyperi models disable' flips this back to false instantly with no
+	// side effects (the pulled model, if any, is left on disk; use
+	// 'hyperi models remove' to delete it).
+	LocalModelEnabled bool `json:"local_model_enabled"`
+
+	// LocalModelName is the Ollama model tag to use (e.g. "qwen2.5:7b"),
+	// selected by hardware-based auto-pick and confirmed by the user during
+	// 'hyperi models setup'.
+	LocalModelName string `json:"local_model_name,omitempty"`
+
+	// OllamaBaseURL is the local Ollama daemon address.
+	// Default: "http://localhost:11434"
+	OllamaBaseURL string `json:"ollama_base_url,omitempty"`
+
+	// LocalModelConfirmedAt records when the user last confirmed local-model
+	// setup, for audit/display purposes.
+	LocalModelConfirmedAt time.Time `json:"local_model_confirmed_at,omitempty"`
+
+	// LocalModelNumCtx sets the Ollama context window (num_ctx) used for
+	// every request to the local model. 0 means "auto" — computed at
+	// startup from the model + detected VRAM via localmodel.RecommendNumCtx.
+	// Ollama does not pick a safe default itself (see internal/llm/ollama.go
+	// docs); this is set explicitly during 'hyperi models setup' rather than
+	// left to the daemon.
+	LocalModelNumCtx int `json:"local_model_num_ctx,omitempty"`
+
+	// LocalModelKeepAlive controls how long Ollama keeps the local model
+	// loaded in memory after the last request (e.g. "30m", "-1" for forever).
+	// Default: "30m" (see llm.DefaultKeepAlive).
+	LocalModelKeepAlive string `json:"local_model_keep_alive,omitempty"`
+
+	// GoalTimeoutMinutes bounds how long a single goal's agent run (the
+	// whole tool-use loop) may take before being cancelled. Default: 30.
+	// Raise this for goals you expect to legitimately take a long time,
+	// especially on a local model.
+	GoalTimeoutMinutes int `json:"goal_timeout_minutes,omitempty"`
+
+	// MaxToolIterations bounds how many tool-call round-trips a single
+	// agent run may perform before being forced to conclude. Default: 30.
+	MaxToolIterations int `json:"max_tool_iterations,omitempty"`
+
+	// Self-modification (see internal/selfmodify). This lets the agent
+	// rebuild its own source tree, verify the result with the same
+	// build+vet+test gate CI enforces, and — only if that passes — swap in
+	// the new binary and restart into it, without requiring the user to
+	// manually rebuild/redeploy.
+	//
+	// SelfModifyEnabled is only ever set to true by an explicit, confirmed
+	// 'hyperi selfmodify enable' run — never automatically — since this
+	// grants the agent the ability to change its own code and restart
+	// itself. 'hyperi selfmodify disable' flips it back to false instantly.
+	SelfModifyEnabled bool `json:"self_modify_enabled"`
+
+	// SelfModifySourceDir is the HyperiOS source tree the self_modify tool
+	// builds from (must contain go.mod and cmd/hyperi). Default: the
+	// directory 'hyperi selfmodify enable' was run from.
+	SelfModifySourceDir string `json:"self_modify_source_dir,omitempty"`
+
+	// SelfModifyBinaryPath is the installed binary path that gets replaced
+	// on a successful Apply. Default: the currently-running executable's path.
+	SelfModifyBinaryPath string `json:"self_modify_binary_path,omitempty"`
+
+	// SelfModifyConfirmedAt records when the user last confirmed
+	// self-modification setup, for audit/display purposes.
+	SelfModifyConfirmedAt time.Time `json:"self_modify_confirmed_at,omitempty"`
+
+	// SelfModifyExplicitlyDisabled is set to true only by
+	// 'hyperi selfmodify disable'. This allows self-modification to be on
+	// by default (the agent can improve itself without setup steps) while
+	// still letting the user turn it off reliably. The distinction matters
+	// because SelfModifyEnabled=false is the default for new configs
+	// (before any selfmodify command is run), and we don't want that
+	// default to mean "disabled" — only an explicit 'disable' command should.
+	SelfModifyExplicitlyDisabled bool `json:"self_modify_explicitly_disabled,omitempty"`
 }
 
 // GeneratorConfig controls the self-improvement template generator.
@@ -163,14 +259,28 @@ func Defaults() *Config {
 		DirectivesImmutablePath: "/etc/hyperi/directives-immutable.yaml",
 		DirectivesMutablePath:   "/var/lib/hyperi/directives-mutable.yaml",
 		// Storage paths
-		GoalStoragePath:     "/var/lib/hyperi/goals.json",
-		MemoryStoragePath:   "/var/lib/hyperi/memory",
-		ToolAuthStoragePath: "/var/lib/hyperi/tool_auth.json",
+		GoalStoragePath:         "/var/lib/hyperi/goals.json",
+		AgentResultsStoragePath: "/var/lib/hyperi/agent_results.json",
+		MemoryStoragePath:       "/var/lib/hyperi/memory",
+		ToolAuthStoragePath:     "/var/lib/hyperi/tool_auth.json",
 		// Agent limits
 		MaxAgentSpawnLimit: 5,
 		// LLM provider
 		LLMProvider: ProviderAnthropic,
 		LLMModel:    "",
+		// Local model — disabled until the user explicitly runs
+		// 'hyperi models setup' and confirms.
+		LocalModelEnabled:   false,
+		OllamaBaseURL:       "http://localhost:11434",
+		LocalModelNumCtx:    0, // 0 = auto-computed from hardware at setup time
+		LocalModelKeepAlive: "30m",
+		// Goal execution limits — generous by default so long-running goals
+		// on a local model have room to actually finish.
+		GoalTimeoutMinutes: 30,
+		MaxToolIterations:  30,
+		// Self-modification — disabled until the user explicitly runs
+		// 'hyperi selfmodify enable' and confirms.
+		SelfModifyEnabled: false,
 	}
 }
 

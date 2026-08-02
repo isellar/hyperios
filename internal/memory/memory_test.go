@@ -1,12 +1,14 @@
 package memory
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/isellar/hyperios/internal/config"
+	"github.com/isellar/hyperios/internal/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -221,10 +223,10 @@ func TestLongTermMemory_Search(t *testing.T) {
 		wantKeys []string
 	}{
 		{"nginx", []string{"nginx.config"}},
-		{"security", []string{"ssh.key"}},        // tag match
-		{"hyperios", []string{"project.name"}},   // value match
-		{"config", []string{"nginx.config"}},     // key + tag match (deduped)
-		{"NGINX", []string{"nginx.config"}},      // case insensitive
+		{"security", []string{"ssh.key"}},      // tag match
+		{"hyperios", []string{"project.name"}}, // value match
+		{"config", []string{"nginx.config"}},   // key + tag match (deduped)
+		{"NGINX", []string{"nginx.config"}},    // case insensitive
 		{"zzz-nomatch", []string{}},
 	}
 
@@ -247,6 +249,80 @@ func TestLongTermMemory_Search(t *testing.T) {
 			t.Errorf("Search(%q): expected no results, got %d", tc.query, len(results))
 		}
 	}
+}
+
+// TestLongTermMemory_Search_TokenizedNotSubstring verifies that Search
+// matches on shared *words* rather than requiring the whole query to appear
+// as a contiguous substring — the key behavioral difference from the old
+// naive implementation. A query like "nginx reverse proxy setup" should
+// still find an entry whose text is "configure nginx as a reverse proxy for
+// port 8080", even though the query never appears verbatim anywhere.
+func TestLongTermMemory_Search_TokenizedNotSubstring(t *testing.T) {
+	lt := newLongTermMemory(filepath.Join(tempDir(t), "lt"))
+
+	_ = lt.Store("goal_outcome:1", "Goal: configure nginx as a reverse proxy for port 8080\nOutcome: succeeded", []string{"goal_outcome"})
+	_ = lt.Store("goal_outcome:2", "Goal: install postgresql and create a database\nOutcome: succeeded", []string{"goal_outcome"})
+
+	results, err := lt.Search("set up an nginx reverse proxy")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d: %+v", len(results), results)
+	}
+	if results[0].Key != "goal_outcome:1" {
+		t.Fatalf("expected goal_outcome:1, got %q", results[0].Key)
+	}
+}
+
+// TestLongTermMemory_Search_RankedByRelevance verifies results come back
+// ordered by relevance score (most query-term overlap first), not
+// filesystem/insertion order.
+func TestLongTermMemory_Search_RankedByRelevance(t *testing.T) {
+	lt := newLongTermMemory(filepath.Join(tempDir(t), "lt"))
+
+	// Stored deliberately out of "relevance order" so a passing test can't
+	// be explained by insertion order coincidentally matching expectations.
+	_ = lt.Store("c_barely_relevant", "mentions nginx once in passing, mostly about something else entirely unrelated", nil)
+	_ = lt.Store("a_most_relevant", "nginx nginx nginx reverse proxy configuration for nginx server", nil)
+	_ = lt.Store("b_somewhat_relevant", "reverse proxy setup using a different tool, not nginx at all", nil)
+
+	results, err := lt.Search("nginx reverse proxy")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) < 2 {
+		t.Fatalf("expected at least 2 results, got %d", len(results))
+	}
+	if results[0].Key != "a_most_relevant" {
+		t.Fatalf("expected most relevant entry first, got order: %v", keysOf(results))
+	}
+}
+
+// TestLongTermMemory_SearchTopN_Limit verifies SearchTopN caps the number
+// of returned results to the highest-scoring ones.
+func TestLongTermMemory_SearchTopN_Limit(t *testing.T) {
+	lt := newLongTermMemory(filepath.Join(tempDir(t), "lt"))
+
+	for i := 0; i < 10; i++ {
+		_ = lt.Store(fmt.Sprintf("entry-%d", i), "shared keyword appears in every entry here", nil)
+	}
+
+	results, err := lt.SearchTopN("shared keyword", 3)
+	if err != nil {
+		t.Fatalf("SearchTopN: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results (limit), got %d", len(results))
+	}
+}
+
+func keysOf(entries []*MemoryEntry) []string {
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.Key
+	}
+	return out
 }
 
 func TestLongTermMemory_SearchEmpty(t *testing.T) {
@@ -297,6 +373,61 @@ func TestLongTermMemory_KeySanitisation(t *testing.T) {
 	}
 	if entry.Value != "test" {
 		t.Fatalf("Recall: want %q, got %v", "test", entry.Value)
+	}
+}
+
+func TestLongTermMemory_SearchByTag(t *testing.T) {
+	lt := newLongTermMemory(filepath.Join(tempDir(t), "lt"))
+
+	_ = lt.Store("a", "value with directive in the text", []string{"directive"})
+	_ = lt.Store("b", "another value", []string{"directive", "extra"})
+	_ = lt.Store("c", "unrelated", []string{"other"})
+	// Substring "directive" appears in this value but the entry has no
+	// "directive" tag — SearchByTag must NOT match it (unlike Search).
+	_ = lt.Store("d", "this mentions directive in passing", []string{"other"})
+
+	results, err := lt.SearchByTag("directive")
+	if err != nil {
+		t.Fatalf("SearchByTag: %v", err)
+	}
+	got := make(map[string]bool)
+	for _, r := range results {
+		got[r.Key] = true
+	}
+	if !got["a"] || !got["b"] {
+		t.Errorf("SearchByTag: expected a and b, got %v", got)
+	}
+	if got["c"] || got["d"] {
+		t.Errorf("SearchByTag: unexpected match, got %v", got)
+	}
+	if len(results) != 2 {
+		t.Errorf("SearchByTag: want 2 results, got %d", len(results))
+	}
+}
+
+func TestLongTermMemory_SearchByTag_CaseInsensitive(t *testing.T) {
+	lt := newLongTermMemory(filepath.Join(tempDir(t), "lt"))
+	_ = lt.Store("a", "v", []string{"Directive"})
+
+	results, err := lt.SearchByTag("directive")
+	if err != nil {
+		t.Fatalf("SearchByTag: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("SearchByTag: expected case-insensitive match, got %d results", len(results))
+	}
+}
+
+func TestLongTermMemory_SearchByTag_NoMatch(t *testing.T) {
+	lt := newLongTermMemory(filepath.Join(tempDir(t), "lt"))
+	_ = lt.Store("a", "v", []string{"other"})
+
+	results, err := lt.SearchByTag("directive")
+	if err != nil {
+		t.Fatalf("SearchByTag: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("SearchByTag: expected 0 results, got %d", len(results))
 	}
 }
 
@@ -365,6 +496,40 @@ func TestMemory_SearchContext(t *testing.T) {
 	}
 	if results[0].Key != "tool.grep" {
 		t.Fatalf("SearchContext: unexpected key %q", results[0].Key)
+	}
+}
+
+// TestMemory_SearchContext_DefaultLimit verifies SearchContext caps results
+// at DefaultSearchLimit even when more entries match.
+func TestMemory_SearchContext_DefaultLimit(t *testing.T) {
+	m := newTestMemory(t)
+	for i := 0; i < DefaultSearchLimit+5; i++ {
+		_ = m.StoreContext(fmt.Sprintf("k%d", i), "shared searchable keyword content")
+	}
+
+	results, err := m.SearchContext("shared searchable keyword")
+	if err != nil {
+		t.Fatalf("SearchContext: %v", err)
+	}
+	if len(results) != DefaultSearchLimit {
+		t.Fatalf("expected %d results (default limit), got %d", DefaultSearchLimit, len(results))
+	}
+}
+
+// TestMemory_SearchContextTopN_CustomLimit verifies the caller-overridable
+// limit variant.
+func TestMemory_SearchContextTopN_CustomLimit(t *testing.T) {
+	m := newTestMemory(t)
+	for i := 0; i < 10; i++ {
+		_ = m.StoreContext(fmt.Sprintf("k%d", i), "shared searchable keyword content")
+	}
+
+	results, err := m.SearchContextTopN("shared searchable keyword", 2)
+	if err != nil {
+		t.Fatalf("SearchContextTopN: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
 	}
 }
 
@@ -445,5 +610,150 @@ func TestMemory_Capabilities(t *testing.T) {
 	caps := m.Capabilities()
 	if len(caps) == 0 {
 		t.Fatal("Capabilities: returned empty slice")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Directive storage tests
+// ---------------------------------------------------------------------------
+
+func TestMemory_AddAndListDirectives(t *testing.T) {
+	m := newTestMemory(t)
+
+	d1 := types.Directive{ID: "d1", Priority: 1, Description: "always check disk space first", Immutable: false}
+	d2 := types.Directive{ID: "d2", Priority: 2, Description: "never delete /etc without confirmation", Immutable: true}
+
+	if err := m.AddDirective(d1); err != nil {
+		t.Fatalf("AddDirective(d1): %v", err)
+	}
+	if err := m.AddDirective(d2); err != nil {
+		t.Fatalf("AddDirective(d2): %v", err)
+	}
+
+	directives, err := m.ListDirectives()
+	if err != nil {
+		t.Fatalf("ListDirectives: %v", err)
+	}
+	if len(directives) != 2 {
+		t.Fatalf("ListDirectives: want 2, got %d: %+v", len(directives), directives)
+	}
+
+	byID := make(map[string]types.Directive)
+	for _, d := range directives {
+		byID[d.ID] = d
+	}
+	if byID["d1"].Description != d1.Description {
+		t.Errorf("d1 description mismatch: got %q, want %q", byID["d1"].Description, d1.Description)
+	}
+	if !byID["d2"].Immutable {
+		t.Error("d2 should be Immutable")
+	}
+	if byID["d2"].Priority != 2 {
+		t.Errorf("d2 priority mismatch: got %d, want 2", byID["d2"].Priority)
+	}
+}
+
+func TestMemory_AddDirective_EmptyID(t *testing.T) {
+	m := newTestMemory(t)
+	err := m.AddDirective(types.Directive{Description: "no id"})
+	if err == nil {
+		t.Fatal("AddDirective: expected error for empty ID")
+	}
+}
+
+func TestMemory_AddDirective_Overwrite(t *testing.T) {
+	m := newTestMemory(t)
+
+	_ = m.AddDirective(types.Directive{ID: "d1", Description: "first version"})
+	_ = m.AddDirective(types.Directive{ID: "d1", Description: "second version"})
+
+	directives, err := m.ListDirectives()
+	if err != nil {
+		t.Fatalf("ListDirectives: %v", err)
+	}
+	if len(directives) != 1 {
+		t.Fatalf("expected overwrite to result in 1 directive, got %d", len(directives))
+	}
+	if directives[0].Description != "second version" {
+		t.Errorf("expected overwritten description, got %q", directives[0].Description)
+	}
+}
+
+func TestMemory_RemoveDirective(t *testing.T) {
+	m := newTestMemory(t)
+	_ = m.AddDirective(types.Directive{ID: "d1", Description: "temp directive"})
+
+	if err := m.RemoveDirective("d1"); err != nil {
+		t.Fatalf("RemoveDirective: %v", err)
+	}
+
+	directives, err := m.ListDirectives()
+	if err != nil {
+		t.Fatalf("ListDirectives: %v", err)
+	}
+	if len(directives) != 0 {
+		t.Fatalf("expected 0 directives after remove, got %d", len(directives))
+	}
+}
+
+func TestMemory_RemoveDirective_Missing(t *testing.T) {
+	m := newTestMemory(t)
+	if err := m.RemoveDirective("nonexistent"); err == nil {
+		t.Fatal("RemoveDirective: expected error for missing directive")
+	}
+}
+
+func TestMemory_ListDirectives_Empty(t *testing.T) {
+	m := newTestMemory(t)
+	directives, err := m.ListDirectives()
+	if err != nil {
+		t.Fatalf("ListDirectives: %v", err)
+	}
+	if len(directives) != 0 {
+		t.Fatalf("expected 0 directives, got %d", len(directives))
+	}
+}
+
+// TestMemory_DirectivesDoNotLeakIntoSearchContext verifies that directives
+// stored via AddDirective don't pollute ordinary SearchContext results.
+// Directives have their own dedicated retrieval path (ListDirectives) and
+// are injected into every agent prompt unconditionally; if they also showed
+// up via SearchContext, a directive could appear twice in the same prompt
+// (once via the directives list, once via a generic search hit) whenever a
+// goal description happens to share words with it.
+func TestMemory_DirectivesDoNotLeakIntoSearchContext(t *testing.T) {
+	m := newTestMemory(t)
+	_ = m.AddDirective(types.Directive{ID: "d1", Description: "disk space check directive"})
+	_ = m.StoreContext("unrelated.key", "some other value")
+
+	directives, err := m.ListDirectives()
+	if err != nil {
+		t.Fatalf("ListDirectives: %v", err)
+	}
+	if len(directives) != 1 {
+		t.Fatalf("expected 1 directive, got %d", len(directives))
+	}
+
+	// SearchContext must NOT return the directive-tagged entry, even though
+	// it's still a long-term entry under the hood and would otherwise match
+	// on "disk space".
+	results, err := m.SearchContext("disk space")
+	if err != nil {
+		t.Fatalf("SearchContext: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("SearchContext: expected 0 matches (directives excluded), got %d: %+v", len(results), results)
+	}
+
+	// The underlying long-term store still has it, reachable via the raw
+	// (unfiltered) Search / SearchByTag paths that ListDirectives itself
+	// uses — SearchContext's filtering is a Memory-level concern, not a
+	// LongTermMemory-level one.
+	raw, err := m.longTerm.Search("disk space")
+	if err != nil {
+		t.Fatalf("longTerm.Search: %v", err)
+	}
+	if len(raw) != 1 {
+		t.Errorf("longTerm.Search: expected 1 raw match, got %d", len(raw))
 	}
 }

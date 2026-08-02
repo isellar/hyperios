@@ -29,6 +29,22 @@ type Goal struct {
 	DependsOn   []string  `json:"depends_on,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+
+	// ClarificationQuestion is set when the goal refiner could not proceed
+	// without more information from the user. While non-empty, the goal is
+	// considered to need attention: it stays in GoalStateRefining and is not
+	// queued for execution. Cleared once the user answers via
+	// GoalFulfillment.AnswerGoal, which re-runs refinement with the answer
+	// folded into the goal description.
+	ClarificationQuestion string `json:"clarification_question,omitempty"`
+
+	// NeedsAttention is true whenever the goal has something the user should
+	// look at — currently only a pending ClarificationQuestion, but the
+	// field exists (rather than callers checking ClarificationQuestion !="")
+	// so future forms of "needs input" (e.g. a permission prompt) can be
+	// added without changing every caller that needs to sort/highlight
+	// these goals.
+	NeedsAttention bool `json:"needs_attention,omitempty"`
 }
 
 // Directive is a behavioral constraint for the agent.

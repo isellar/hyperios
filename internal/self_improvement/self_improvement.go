@@ -2,6 +2,8 @@ package self_improvement
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -19,6 +21,25 @@ type GoalSubmitter interface {
 	SubmitGoal(description string) (*types.Goal, error)
 }
 
+// DirectiveStore is the narrow interface SelfImprovement uses to persist
+// standing directives it derives from analysis. *memory.Memory implements
+// this; defined here (rather than importing internal/memory directly) to
+// avoid a circular import and to keep SelfImprovement's dependency surface
+// minimal and mockable.
+type DirectiveStore interface {
+	AddDirective(d types.Directive) error
+}
+
+// directiveIDFromDescription derives a stable ID for a learned directive from
+// its description text, so that the analyzer re-suggesting the same rule
+// across multiple Analyze() cycles overwrites the existing entry (via
+// Memory.AddDirective's overwrite-on-same-ID semantics) instead of
+// accumulating duplicate directives with different random IDs.
+func directiveIDFromDescription(description string) string {
+	sum := sha256.Sum256([]byte(description))
+	return "learned-" + hex.EncodeToString(sum[:])[:12]
+}
+
 // SelfImprovement analyses accumulated execution results and generates
 // improvement goals that are re-submitted as user-level goals.
 //
@@ -32,6 +53,7 @@ type SelfImprovement struct {
 	audit    *audit.Logger
 
 	goalFulfillment GoalSubmitter
+	directiveStore  DirectiveStore
 
 	// Buffered results waiting to be analysed.
 	pending []GoalResult
@@ -48,17 +70,11 @@ type SelfImprovement struct {
 //
 // A nil llmClient is accepted: Analyze() will return an error rather than
 // panic when no LLM is configured.
-func NewSelfImprovement(cfg *config.Config, llmClient *llm.Client, auditLogger *audit.Logger) *SelfImprovement {
+func NewSelfImprovement(cfg *config.Config, llmClient llm.Completer, auditLogger *audit.Logger) *SelfImprovement {
 	stats := NewStats()
-	// Guard against a typed-nil interface: if the concrete pointer is nil,
-	// pass a true nil interface so Analyzer.AnalyzeResults can detect it.
-	var completer llm.Completer
-	if llmClient != nil {
-		completer = llmClient
-	}
 	return &SelfImprovement{
 		cfg:       cfg,
-		analyzer:  NewAnalyzer(completer, stats),
+		analyzer:  NewAnalyzer(llmClient, stats),
 		stats:     stats,
 		audit:     auditLogger,
 		sessionID: fmt.Sprintf("si-%d", time.Now().UnixNano()),
@@ -71,6 +87,15 @@ func (si *SelfImprovement) SetGoalFulfillment(gf GoalSubmitter) {
 	si.mu.Lock()
 	defer si.mu.Unlock()
 	si.goalFulfillment = gf
+}
+
+// SetDirectiveStore wires the DirectiveStore dependency used to persist
+// standing directives derived from analysis. Optional: if unset, Analyze
+// still submits improvement goals but silently skips directive persistence.
+func (si *SelfImprovement) SetDirectiveStore(ds DirectiveStore) {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	si.directiveStore = ds
 }
 
 // RecordResult stores a goal result in the pending buffer and updates stats.
@@ -91,17 +116,22 @@ func (si *SelfImprovement) RecordResult(result GoalResult) {
 // Analyze runs the full analysis cycle:
 //  1. Drains the pending result buffer.
 //  2. Calls the LLM analyzer.
-//  3. Submits each improvement goal to GoalFulfillment.
-//  4. Logs each submitted goal via the audit logger.
+//  3. Submits each one-off improvement goal to GoalFulfillment, AND/OR
+//     persists each standing directive to the DirectiveStore — whichever
+//     the analyzer determined applies (see analyzerSystem's prompt: it may
+//     return goals only, directives only, both, or neither).
+//  4. Logs each submitted goal / persisted directive via the audit logger.
 //
 // Returns an error if analysis fails or no GoalSubmitter is configured.
-// Partial errors (individual goal-submission failures) are collected and returned
-// as a combined error so that a single failure does not abort the whole cycle.
+// Partial errors (individual goal-submission or directive-persistence
+// failures) are collected and returned as a combined error so that a single
+// failure does not abort the whole cycle.
 func (si *SelfImprovement) Analyze() error {
 	si.mu.Lock()
 	results := si.pending
 	si.pending = nil
 	gf := si.goalFulfillment
+	ds := si.directiveStore
 	si.mu.Unlock()
 
 	if gf == nil {
@@ -125,6 +155,8 @@ func (si *SelfImprovement) Analyze() error {
 	}
 
 	var errs []error
+
+	// One-off improvement goals — re-submitted as regular goals, run once.
 	for _, goalDesc := range analysis.ImprovementGoals {
 		if goalDesc == "" {
 			continue
@@ -132,7 +164,7 @@ func (si *SelfImprovement) Analyze() error {
 
 		goal, submitErr := gf.SubmitGoal(goalDesc)
 		if submitErr != nil {
-			errs = append(errs, fmt.Errorf("submit %q: %w", goalDesc, submitErr))
+			errs = append(errs, fmt.Errorf("submit improvement goal %q: %w", goalDesc, submitErr))
 			continue
 		}
 
@@ -143,6 +175,64 @@ func (si *SelfImprovement) Analyze() error {
 				Source:      "self_improvement:analyze",
 				Confidence:  si.stats.SuccessRate(),
 			})
+		}
+	}
+
+	// Code changes — submitted as goals for the agent to carry out using
+	// the shell + self_modify tool loop. The agent edits source files, runs
+	// self_modify verify, and applies if it passes. No human involvement.
+	// Prefixed with "[CODE CHANGE]" so the agent (and logs) can distinguish
+	// these from ordinary environment-level improvement goals.
+	for _, changeDesc := range analysis.CodeChanges {
+		if changeDesc == "" {
+			continue
+		}
+
+		goalDesc := "[CODE CHANGE] " + changeDesc
+		goal, submitErr := gf.SubmitGoal(goalDesc)
+		if submitErr != nil {
+			errs = append(errs, fmt.Errorf("submit code change goal %q: %w", changeDesc, submitErr))
+			continue
+		}
+
+		if si.audit != nil {
+			_ = si.audit.LogSelfImprovementGoal(si.sessionID, audit.SelfImprovementGoal{
+				GoalID:      goal.ID,
+				Description: goalDesc,
+				Source:      "self_improvement:analyze:code_change",
+				Confidence:  si.stats.SuccessRate(),
+			})
+		}
+	}
+
+	// Standing directives — persisted so every future goal's prompt includes
+	// them (see Processor.RunNext -> AgentSpawner). Not mutually exclusive
+	// with the above; the analyzer may return any combination.
+	if ds != nil {
+		for _, sugg := range analysis.Directives {
+			if sugg.Description == "" {
+				continue
+			}
+
+			d := types.Directive{
+				ID:          directiveIDFromDescription(sugg.Description),
+				Priority:    sugg.Priority,
+				Description: sugg.Description,
+				Immutable:   false, // learned directives are always user-revisable
+			}
+			if addErr := ds.AddDirective(d); addErr != nil {
+				errs = append(errs, fmt.Errorf("persist directive %q: %w", sugg.Description, addErr))
+				continue
+			}
+
+			if si.audit != nil {
+				_ = si.audit.LogSelfImprovementGoal(si.sessionID, audit.SelfImprovementGoal{
+					GoalID:      d.ID,
+					Description: sugg.Description,
+					Source:      "self_improvement:analyze:directive",
+					Confidence:  si.stats.SuccessRate(),
+				})
+			}
 		}
 	}
 

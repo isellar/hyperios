@@ -59,11 +59,11 @@ func NewRefiner(client llm.Completer, memory MemoryProvider, processor Processor
 }
 
 type refinementResponse struct {
-	Intent                string     `json:"intent"`
-	Context               string     `json:"context"`
+	Intent                string       `json:"intent"`
+	Context               string       `json:"context"`
 	Goals                 []types.Goal `json:"goals"`
-	ClarificationNeeded   bool       `json:"clarification_needed"`
-	ClarificationQuestion string     `json:"clarification_question"`
+	ClarificationNeeded   bool         `json:"clarification_needed"`
+	ClarificationQuestion string       `json:"clarification_question"`
 }
 
 func (r *Refiner) RefineGoal(ctx context.Context, goal *types.Goal) (*types.Goal, error) {
@@ -106,19 +106,32 @@ Processor context:
 
 	if resp.ClarificationNeeded {
 		goal.State = types.GoalStateRefining
+		goal.ClarificationQuestion = resp.ClarificationQuestion
+		goal.NeedsAttention = true
 		goal.UpdatedAt = time.Now()
 		return goal, &ClarificationNeededError{Question: resp.ClarificationQuestion}
 	}
 
 	if len(resp.Goals) > 0 {
 		refined := resp.Goals[0]
+		// The LLM is asked to invent an "id" per the schema example (which
+		// literally shows "id": "g1"), but that ID must never replace the
+		// real tracked goal ID — doing so orphans the original goal (stuck
+		// forever in its prior state) and creates an unrelated new one,
+		// which is especially bad right after answering a clarification
+		// question: the goal the user just answered would appear to vanish.
+		refined.ID = goal.ID
 		refined.State = types.GoalStateActive
 		refined.CreatedAt = goal.CreatedAt
 		refined.UpdatedAt = time.Now()
+		refined.ClarificationQuestion = ""
+		refined.NeedsAttention = false
 		return &refined, nil
 	}
 
 	goal.State = types.GoalStateActive
+	goal.ClarificationQuestion = ""
+	goal.NeedsAttention = false
 	goal.UpdatedAt = time.Now()
 	return goal, nil
 }

@@ -16,17 +16,9 @@ build:
     GOOS=linux GOARCH=amd64 go build -o dist/hyperi-linux-amd64 ./cmd/hyperi
     GOOS=linux GOARCH=arm64 go build -o dist/hyperi-linux-arm64 ./cmd/hyperi
 
-# Run all unit tests
+# Run all unit + integration tests
 test:
     go test -race ./...
-
-# Run integration tests (requires ANTHROPIC_API_KEY)
-test-integration:
-    go test -tags integration -race ./...
-
-# Run docker executor tests (requires Docker)
-test-docker:
-    go test -tags docker ./internal/executor/...
 
 # Lint
 lint:

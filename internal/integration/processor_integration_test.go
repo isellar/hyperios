@@ -5,10 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/isellar/hyperios/internal/config"
 	"github.com/isellar/hyperios/internal/goal_fulfillment"
-	"github.com/isellar/hyperios/internal/governor"
-	"github.com/isellar/hyperios/internal/governor/capability"
 	"github.com/isellar/hyperios/internal/processor"
 	"github.com/isellar/hyperios/internal/types"
 )
@@ -39,15 +36,12 @@ func activeGoal(id, description string) *types.Goal {
 // TestProcessorQueueAndRun
 // ---------------------------------------------------------------------------
 
-// TestProcessorQueueAndRun wires Processor with a mock Governor (approves) and
-// mock GoalUpdater, queues a goal, runs it, and verifies the result is recorded.
+// TestProcessorQueueAndRun wires Processor with a mock GoalUpdater, queues a
+// goal, runs it, and verifies the result is recorded.
 func TestProcessorQueueAndRun(t *testing.T) {
 	proc := newTestProcessor(t)
 
-	gov := &mockGovernorReviewer{approved: true, reason: "all good"}
 	updater := &mockGoalUpdater{}
-
-	proc.SetGovernor(gov)
 	proc.SetGoalFulfillment(updater)
 
 	goal := activeGoal("g-run-1", "write a hello world program")
@@ -79,43 +73,6 @@ func TestProcessorQueueAndRun(t *testing.T) {
 	}
 	if last.state != types.GoalStateDone {
 		t.Errorf("updated state = %q, want %q", last.state, types.GoalStateDone)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestProcessorGovernorRejection
-// ---------------------------------------------------------------------------
-
-// TestProcessorGovernorRejection verifies that a goal rejected by the governor
-// returns an error from QueueGoal and is never executed.
-func TestProcessorGovernorRejection(t *testing.T) {
-	proc := newTestProcessor(t)
-
-	gov := &mockGovernorReviewer{approved: false, reason: "violates directive: do not harm"}
-	updater := &mockGoalUpdater{}
-
-	proc.SetGovernor(gov)
-	proc.SetGoalFulfillment(updater)
-
-	goal := activeGoal("g-rejected-1", "delete all user data")
-
-	err := proc.QueueGoal(goal)
-	if err == nil {
-		t.Fatal("expected error when governor rejects goal")
-	}
-
-	// Queue should be empty — rejected goal not enqueued.
-	result, err := proc.RunNext()
-	if err != nil {
-		t.Fatalf("RunNext on empty queue: %v", err)
-	}
-	if result != nil {
-		t.Errorf("expected nil result from empty queue, got: %+v", result)
-	}
-
-	// GoalFulfillment should NOT have been called.
-	if len(updater.updates) != 0 {
-		t.Errorf("expected no state updates for rejected goal, got %d", len(updater.updates))
 	}
 }
 
@@ -161,8 +118,8 @@ func TestProcessorMemoryLookup_NoMemory(t *testing.T) {
 // TestProcessorFullWiring
 // ---------------------------------------------------------------------------
 
-// TestProcessorFullWiring connects Processor ↔ GoalFulfillment ↔ Governor in
-// a realistic configuration (all real implementations, mock LLM).
+// TestProcessorFullWiring connects Processor <-> GoalFulfillment in a
+// realistic configuration (all real implementations, mock LLM).
 func TestProcessorFullWiring(t *testing.T) {
 	cfg := newTestConfig(t)
 	auditLog := newMockAudit(t)
@@ -178,18 +135,7 @@ func TestProcessorFullWiring(t *testing.T) {
 		t.Fatalf("goal_fulfillment.New: %v", err)
 	}
 
-	// Real Governor (no executor needed for this test).
-	reg := capability.NewRegistry()
-	gov := governor.New(governor.GovernorConfig{
-		AutonomyLevel: config.AutonomyTrusted,
-		Registry:      reg,
-		AuditLogger:   auditLog,
-		SessionID:     "integration-test",
-		ToolAuthPath:  filepath.Join(t.TempDir(), "tool_auth.json"),
-	})
-
 	// Wire bidirectionally.
-	proc.SetGovernor(&realGovernorAdapter{g: gov})
 	proc.SetGoalFulfillment(gf)
 	proc.SetMemory(newMockMemoryQuerier())
 
@@ -232,17 +178,4 @@ func TestProcessorFullWiring(t *testing.T) {
 	if final.State != types.GoalStateDone {
 		t.Errorf("expected final state Done, got %q", final.State)
 	}
-}
-
-// realGovernorAdapter bridges *governor.Governor to processor.GovernorReviewer.
-type realGovernorAdapter struct {
-	g *governor.Governor
-}
-
-func (a *realGovernorAdapter) ReviewGoal(goal *types.Goal) (*governor.ReviewResult, error) {
-	return a.g.ReviewGoal(goal)
-}
-
-func (a *realGovernorAdapter) CheckToolAuthorized(toolID string) bool {
-	return a.g.ToolAuth().CheckAuthorization(toolID)
 }

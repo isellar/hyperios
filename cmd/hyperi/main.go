@@ -1,12 +1,13 @@
 // Package main is the CLI entry point for HyperiOS.
 //
-// Primary interface: `hyperi` launches the persistent TUI shell (Phase 2).
-// The TUI wires the full pipeline, event bus, audit trail, plan docs, inotify
-// watcher, and in-process scheduler together.
+// Primary interface: `hyperi serve` (also the default action with no
+// subcommand) starts the HTTP API server and the background goal-processing
+// loop. Any UI — web, CLI, mobile — talks to the agent through this API;
+// see internal/apiserver for the route list.
 //
-// Secondary (headless) interface: `hyperi session start --no-tui [intent]`
-// runs a single pipeline pass without the TUI — useful over SSH or from
-// systemd when no terminal is available.
+// `hyperi` is a fire-and-forget system: submitting a goal via the API queues
+// it for background execution immediately (unless marked as a draft); the
+// caller polls for results rather than blocking on a request.
 package main
 
 import (
@@ -14,56 +15,24 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
-	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/isellar/hyperios/internal/apiserver"
 	"github.com/isellar/hyperios/internal/audit"
-	"github.com/isellar/hyperios/internal/cache"
 	"github.com/isellar/hyperios/internal/config"
-	"github.com/isellar/hyperios/internal/events"
-	"github.com/isellar/hyperios/internal/governor/capability"
-	"github.com/isellar/hyperios/internal/llm"
-	"github.com/isellar/hyperios/internal/manifest"
-	"github.com/isellar/hyperios/internal/plan"
-	"github.com/isellar/hyperios/internal/router"
-	"github.com/isellar/hyperios/internal/scheduler"
-	"github.com/isellar/hyperios/internal/session"
-	"github.com/isellar/hyperios/internal/shell"
 )
 
 // version is set at build time via -ldflags "-X main.version=x.y.z".
 var version = "dev"
 
 func main() {
-	cfg, err := loadConfig("")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	apiKey := resolveAPIKey(cfg)
-	llmClient := llm.NewClientForProvider(cfg.LLMProvider, apiKey, cfg.LLMModel)
-
-	auditLogPath := resolveLogDir() + "/audit.jsonl"
-	auditLog, err := audit.NewLogger(auditLogPath)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	modules, err := WireModules(cfg, llmClient, auditLog)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Wire the new App as the default (no-subcommand) action.
-	// All existing subcommands (session, plans, config, version, templates)
-	// continue to work via the cobra CLI.
-	app := NewApp(modules)
-	root := buildRoot(app)
+	root := buildRoot()
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -72,449 +41,97 @@ func main() {
 
 // ── Root command ──────────────────────────────────────────────────────────────
 
-func buildRoot(app *App) *cobra.Command {
+func buildRoot() *cobra.Command {
 	var cfgPath string
-	var autonomyFlag int
-	autonomyChanged := false
 
 	root := &cobra.Command{
 		Use:   "hyperi",
-		Short: "HyperiOS — AI-driven Linux OS interface",
-		Long: `hyperi is the HyperiOS agent shell.
+		Short: "HyperiOS — AI-driven agent server",
+		Long: `hyperi is the HyperiOS agent server.
 
-Running without a subcommand launches the interactive agent loop (Phase 4).
-Type your intent at the prompt; hyperi plans, executes, and reports.
-
-Use subcommands for headless/scripted operation.`,
+Running without a subcommand is equivalent to 'hyperi serve': it starts the
+HTTP API and begins processing queued goals in the background. Any UI talks
+to the agent through the API — see internal/apiserver for the route list.`,
 		Version: version,
-		// Default action: run the wired App interaction loop.
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if autonomyChanged {
-				// Re-load config if autonomy was overridden on the CLI.
-				cfg, err := loadConfig(cfgPath)
-				if err != nil {
-					return err
-				}
-				cfg.AutonomyLevel = autonomyFlag
-				_ = cfg // autonomy override noted; modules already wired with defaults.
-			}
-			return app.Run(context.Background())
+			return runServe(cfgPath, defaultServeAddr)
 		},
 	}
 
 	root.PersistentFlags().StringVar(&cfgPath, "config", "", "Path to config.json (default: auto-detected)")
-	root.PersistentFlags().IntVarP(&autonomyFlag, "autonomy", "a", config.AutonomyApproved,
-		"Autonomy level 0–4 (overrides config for this session)")
-	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
-		autonomyChanged = cmd.Flags().Changed("autonomy")
-		return nil
-	}
 
-	root.AddCommand(buildSessionCmd())
-	root.AddCommand(buildPlansCmd())
+	root.AddCommand(buildServeCmd())
 	root.AddCommand(buildConfigCmd())
+	root.AddCommand(buildModelsCmd())
+	root.AddCommand(buildSelfModifyCmd())
 	root.AddCommand(buildVersionCmd())
-	root.AddCommand(buildTemplatesCmd())
 
 	return root
 }
 
-// ── Infrastructure bootstrap ──────────────────────────────────────────────────
+// ── serve command ─────────────────────────────────────────────────────────────
 
-// bootstrap creates all shared infrastructure (dirs, config, registry, bus,
-// manifest, scheduler, audit logger, session manager).  Everything that needs
-// to be shared between the shell, the headless runner, and the web UI lives
-// here so it is only constructed once.
-type infra struct {
-	cfg        *config.Config
-	dataPathFn func(string) string
-	logPathFn  func(string) string
-	notifier   *events.Notifier
-	registry   *capability.Registry
-	validator  *capability.CommandValidator
-	manifestSt *manifest.Store
-	sessionMgr *session.Manager
-	auditLog   *audit.Logger
-	sched      *scheduler.Scheduler
-	apiKey     string
-	workDir    string
-}
+const defaultServeAddr = ":8080"
 
-func bootstrap(cfg *config.Config) (*infra, error) {
-	// ── Paths ─────────────────────────────────────────────────────────────────
-	dataDir := resolveDataDir()
-	logDir := resolveLogDir()
-
-	dataPathFn := func(rel string) string { return filepath.Join(dataDir, rel) }
-	logPathFn := func(rel string) string { return filepath.Join(logDir, rel) }
-
-	for _, dir := range []string{
-		dataPathFn("sessions"),
-		dataPathFn("plans"),
-		logDir,
-	} {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return nil, fmt.Errorf("bootstrap: create dir %s: %w", dir, err)
-		}
-	}
-
-	// ── API key ───────────────────────────────────────────────────────────────
-	apiKey := resolveAPIKey(cfg)
-
-	// ── Event notifier ────────────────────────────────────────────────────────
-	n := events.NewNotifier(512)
-
-	// ── Capability registry ───────────────────────────────────────────────────
-	reg := capability.NewRegistry()
-	cwd, _ := os.Getwd()
-	reg.SetWorkspace(cwd)
-
-	allowlistPath := dataPathFn("allowlist.yaml")
-	if _, err := os.Stat(allowlistPath); os.IsNotExist(err) {
-		// Not in data dir yet — try to seed it from the repo-bundled copy,
-		// then fall back to the repo path directly if seeding fails.
-		repoAllowlist := findRepoAllowlist()
-		if repoAllowlist != "" {
-			// Copy it into the data dir so future runs find it there.
-			if data, readErr := os.ReadFile(repoAllowlist); readErr == nil {
-				_ = os.WriteFile(allowlistPath, data, 0o640)
-			}
-		}
-		// Re-check: use data dir copy if it now exists, else repo path, else give up.
-		if _, err2 := os.Stat(allowlistPath); os.IsNotExist(err2) {
-			if repoAllowlist != "" {
-				allowlistPath = repoAllowlist
-			}
-		}
-	}
-	if err := reg.LoadAllowlist(allowlistPath); err != nil {
-		// Non-fatal: restricted mode — all steps will require explicit grants.
-		fmt.Fprintf(os.Stderr, "Warning: could not load allowlist (%s): %v\n", allowlistPath, err)
-	}
-
-	// ── Command validator ─────────────────────────────────────────────────────
-	mstore := manifest.NewStore(dataPathFn("manifest.json"))
-	// Seed defaults if the manifest doesn't exist yet
-	if _, err := os.Stat(dataPathFn("manifest.json")); os.IsNotExist(err) {
-		mstore.SeedDefaults()
-		_ = mstore.Save()
-	} else {
-		_ = mstore.Load()
-	}
-	validator := capability.NewCommandValidator(reg).WithManifest(mstore)
-
-	// ── Session manager ───────────────────────────────────────────────────────
-	sessionMgr := session.NewManager(dataPathFn("sessions"))
-
-	// ── Audit logger ──────────────────────────────────────────────────────────
-	auditLog, err := audit.NewLogger(logPathFn("audit.jsonl"))
-	if err != nil {
-		return nil, fmt.Errorf("bootstrap: audit logger: %w", err)
-	}
-
-	// ── Scheduler ─────────────────────────────────────────────────────────────
-	sched := scheduler.New(n)
-	sched.DefaultJobs(
-		// manifest:rescan
-		func() {
-			_ = mstore.Load()
-			n.Publish(events.Event{
-				Kind:      events.EventManifestUpdated,
-				Payload:   "periodic rescan",
-				Timestamp: time.Now(),
-			})
-		},
-		// session:cleanup — remove sessions older than 30 days
-		func() { _ = sessionMgr.CleanupOld(30 * 24 * time.Hour) },
-		// audit:rotate — rename audit.jsonl → audit-<date>.jsonl
-		func() { rotateAuditLog(logPathFn("audit.jsonl")) },
+func buildServeCmd() *cobra.Command {
+	var (
+		cfgPath string
+		addr    string
 	)
-	sched.Start()
 
-	return &infra{
-		cfg:        cfg,
-		dataPathFn: dataPathFn,
-		logPathFn:  logPathFn,
-		notifier:   n,
-		registry:   reg,
-		validator:  validator,
-		manifestSt: mstore,
-		sessionMgr: sessionMgr,
-		auditLog:   auditLog,
-		sched:      sched,
-		apiKey:     apiKey,
-		workDir:    cwd,
-	}, nil
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Start the HyperiOS agent HTTP API server",
+		Long: `Starts the HTTP API server and the background goal-processing loop.
+
+Goals submitted via POST /api/goals are queued and executed asynchronously;
+poll GET /api/goals/{id} or GET /api/goals/{id}/result to observe progress.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runServe(cfgPath, addr)
+		},
+	}
+
+	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to config.json")
+	cmd.Flags().StringVar(&addr, "addr", defaultServeAddr, "HTTP listen address")
+	return cmd
 }
 
-// ── Shell launch ──────────────────────────────────────────────────────────────
-
-func launchShell(cfg *config.Config) error {
-	infra, err := bootstrap(cfg)
+// runServe loads config, wires all modules, and blocks serving the API until
+// interrupted (SIGINT/SIGTERM) or the server errors.
+func runServe(cfgPath, addr string) error {
+	cfg, err := loadConfig(cfgPath)
 	if err != nil {
-		return err
-	}
-	defer infra.sched.Stop()
-	defer infra.notifier.Close()
-
-	// Start inotify watcher on watched paths (best-effort, non-fatal)
-	watcher, watchErr := manifest.NewWatcher(infra.manifestSt, infra.notifier, cfg.WatchPaths)
-	if watchErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: inotify watcher could not initialise: %v\n", watchErr)
-	} else {
-		watcher.Start()
-		defer watcher.Stop()
+		return fmt.Errorf("load config: %w", err)
 	}
 
-	s := shell.NewShell(shell.Config{
-		APIKey:        infra.apiKey,
-		HypConfig:     infra.cfg,
-		ConfigPath:    defaultConfigPath(),
-		Notifier:      infra.notifier,
-		Registry:      infra.registry,
-		Validator:     infra.validator,
-		ManifestStore: infra.manifestSt,
-		SessionMgr:    infra.sessionMgr,
-		AuditLogger:   infra.auditLog,
-		DataPathFn:    infra.dataPathFn,
-		LogPathFn:     infra.logPathFn,
-		WorkDir:       infra.workDir,
+	llmClient := buildLLMClient(cfg)
+
+	auditLogPath := filepath.Join(resolveLogDir(), "audit.jsonl")
+	auditLog, err := audit.NewLogger(auditLogPath)
+	if err != nil {
+		return fmt.Errorf("create audit logger: %w", err)
+	}
+
+	modules, err := WireModules(cfg, llmClient, auditLog)
+	if err != nil {
+		return fmt.Errorf("wire modules: %w", err)
+	}
+
+	srv := apiserver.New(addr, &apiserver.Modules{
+		GoalFulfillment: modules.GoalFulfillment,
+		Processor:       modules.Processor,
+		Memory:          modules.Memory,
+		SelfImprovement: modules.SelfImprovement,
+		IOToolbox:       modules.IOToolbox,
+		Config:          cfg,
+		ResultStore:     modules.ResultStore,
 	})
 
-	return s.Run()
-}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-// ── session command ───────────────────────────────────────────────────────────
-
-func buildSessionCmd() *cobra.Command {
-	sessionCmd := &cobra.Command{
-		Use:   "session",
-		Short: "Manage agent sessions",
-	}
-	sessionCmd.AddCommand(buildSessionStartCmd())
-	sessionCmd.AddCommand(buildSessionListCmd())
-	sessionCmd.AddCommand(buildSessionResumeCmd())
-	return sessionCmd
-}
-
-func buildSessionStartCmd() *cobra.Command {
-	var (
-		noTUI        bool
-		execute      bool
-		autonomyFlag int
-		cfgPath      string
-	)
-
-	cmd := &cobra.Command{
-		Use:   "start [intent]",
-		Short: "Start a new agent session",
-		Long: `Run the full agent pipeline for the given intent.
-
-Without --no-tui, this is equivalent to running 'hyperi' and typing the intent.
-With --no-tui, runs the pipeline headlessly (useful from scripts or systemd).`,
-		Args: cobra.ArbitraryArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			intent := strings.Join(args, " ")
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-			if cmd.Flags().Changed("autonomy") {
-				cfg.AutonomyLevel = autonomyFlag
-			}
-
-			if !noTUI {
-				// Launch TUI with the intent pre-filled
-				return launchShellWithIntent(cfg, intent, execute)
-			}
-
-			// Headless mode
-			return runHeadless(cfg, intent, execute)
-		},
-	}
-
-	cmd.Flags().BoolVar(&noTUI, "no-tui", false, "Run headlessly without the TUI")
-	cmd.Flags().BoolVar(&execute, "execute", false, "Execute arbiter-approved steps (headless mode only)")
-	cmd.Flags().IntVar(&autonomyFlag, "autonomy", config.AutonomyApproved, "Autonomy level 0–4")
-	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to config.json")
-	return cmd
-}
-
-func buildSessionListCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "list",
-		Short: "List recent sessions",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			mgr := session.NewManager(filepath.Join(resolveDataDir(), "sessions"))
-			sessions, err := mgr.List()
-			if err != nil {
-				return fmt.Errorf("list sessions: %w", err)
-			}
-			if len(sessions) == 0 {
-				fmt.Println("No sessions found.")
-				return nil
-			}
-			fmt.Printf("%-10s  %-10s  %-20s  %s\n", "ID", "STATUS", "UPDATED", "INTENT")
-			fmt.Println(strings.Repeat("─", 72))
-			for _, s := range sessions {
-				status := s.Status
-				if status == "" {
-					status = "unknown"
-				}
-				fmt.Printf("%-10s  %-10s  %-20s  %s\n",
-					s.ID,
-					status,
-					s.UpdatedAt.Format("2006-01-02 15:04:05"),
-					truncate(s.Intent, 36),
-				)
-			}
-			return nil
-		},
-	}
-}
-
-func buildSessionResumeCmd() *cobra.Command {
-	var cfgPath string
-
-	cmd := &cobra.Command{
-		Use:   "resume <session-id>",
-		Short: "Resume a halted or in-progress session",
-		Long: `Re-opens the TUI and resumes a halted session.
-For approval-halted sessions, re-presents the pending approval prompt.
-For execution-halted sessions, re-enters the re-plan loop.`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			sessionID := args[0]
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			planPath := filepath.Join(dataDir, "plans", sessionID+".md")
-			if _, err := os.Stat(planPath); os.IsNotExist(err) {
-				return fmt.Errorf("no plan doc found for session %s (expected %s)", sessionID, planPath)
-			}
-
-			planState, err := plan.ParsePlanDoc(planPath)
-			if err != nil {
-				return fmt.Errorf("parse plan doc: %w", err)
-			}
-
-			switch planState.Status {
-			case plan.StatusCompleted:
-				fmt.Printf("Session %s is already completed.\n", sessionID)
-				return nil
-			case plan.StatusInProgress, plan.StatusHalted, plan.StatusFailed:
-				fmt.Printf("Resuming session %s (status: %s)...\n", sessionID, planState.Status)
-			default:
-				fmt.Printf("Session %s has unknown status %q — attempting resume anyway.\n", sessionID, planState.Status)
-			}
-
-			// Launch TUI with resume intent
-			resumeIntent := fmt.Sprintf("__resume__:%s", sessionID)
-			return launchShellWithIntent(cfg, resumeIntent, true)
-		},
-	}
-
-	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to config.json")
-	return cmd
-}
-
-// ── plans command ─────────────────────────────────────────────────────────────
-
-func buildPlansCmd() *cobra.Command {
-	var statusFilter string
-
-	cmd := &cobra.Command{
-		Use:   "plans",
-		Short: "List plan documents by status",
-		Long: `List all plan documents, optionally filtered by status.
-
-Status values: in-progress, completed, failed, halted
-
-Plan documents are stored at <data-dir>/plans/<session-id>.md`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			plansDir := filepath.Join(resolveDataDir(), "plans")
-			entries, err := os.ReadDir(plansDir)
-			if err != nil {
-				if os.IsNotExist(err) {
-					fmt.Println("No plans found.")
-					return nil
-				}
-				return fmt.Errorf("read plans dir: %w", err)
-			}
-
-			type planSummary struct {
-				path      string
-				name      string
-				status    string
-				sessionID string
-				modTime   time.Time
-			}
-
-			var plans []planSummary
-			for _, entry := range entries {
-				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
-					continue
-				}
-				path := filepath.Join(plansDir, entry.Name())
-				state, err := plan.ParsePlanDoc(path)
-				if err != nil {
-					continue
-				}
-				if statusFilter != "" && state.Status != statusFilter {
-					continue
-				}
-				info, _ := entry.Info()
-				mod := time.Time{}
-				if info != nil {
-					mod = info.ModTime()
-				}
-				displayName := state.Name
-				if displayName == "" {
-					displayName = strings.TrimSuffix(entry.Name(), ".md")
-				}
-				plans = append(plans, planSummary{
-					path:      path,
-					name:      displayName,
-					status:    state.Status,
-					sessionID: state.SessionID,
-					modTime:   mod,
-				})
-			}
-
-			if len(plans) == 0 {
-				if statusFilter != "" {
-					fmt.Printf("No plans with status %q found.\n", statusFilter)
-				} else {
-					fmt.Println("No plans found.")
-				}
-				return nil
-			}
-
-			// Sort by mod time descending
-			sort.Slice(plans, func(i, j int) bool {
-				return plans[i].modTime.After(plans[j].modTime)
-			})
-
-			fmt.Printf("%-10s  %-12s  %-20s  %s\n", "SESSION", "STATUS", "UPDATED", "NAME")
-			fmt.Println(strings.Repeat("─", 80))
-			for _, p := range plans {
-				fmt.Printf("%-10s  %-12s  %-20s  %s\n",
-					p.sessionID,
-					p.status,
-					p.modTime.Format("2006-01-02 15:04:05"),
-					p.name,
-				)
-			}
-			fmt.Printf("\nPlan documents: %s\n", plansDir)
-			return nil
-		},
-	}
-
-	cmd.Flags().StringVarP(&statusFilter, "status", "s", "", "Filter by status (in-progress|completed|failed|halted)")
-	return cmd
+	log.Printf("hyperi %s starting on %s", version, addr)
+	return srv.Start(ctx)
 }
 
 // ── config command ────────────────────────────────────────────────────────────
@@ -536,9 +153,10 @@ func buildConfigGetCmd() *cobra.Command {
 		Short: "Get a config value",
 		Long: `Get a configuration value by key.
 
-Keys: autonomy_level, approval_timeout_foreground, approval_timeout_background,
-      voice_enabled, voice_push_to_talk_key, whisper_model_path,
-      llm_provider, llm_api_key, llm_model`,
+Keys: autonomy_level, llm_provider, llm_api_key, llm_model,
+      goal_timeout_minutes, max_tool_iterations,
+      local_model_num_ctx, local_model_keep_alive
+(local model keys not listed here — see 'hyperi models status')`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig("")
@@ -549,24 +167,26 @@ Keys: autonomy_level, approval_timeout_foreground, approval_timeout_background,
 			switch key {
 			case "autonomy_level":
 				fmt.Printf("%d  (%s)\n", cfg.AutonomyLevel, config.AutonomyLevelText(cfg.AutonomyLevel))
-			case "approval_timeout_foreground":
-				fmt.Printf("%ds\n", cfg.ApprovalTimeoutForeground)
-			case "approval_timeout_background":
-				fmt.Printf("%ds\n", cfg.ApprovalTimeoutBackground)
-			case "voice_enabled":
-				fmt.Printf("%v\n", cfg.VoiceEnabled)
-			case "voice_push_to_talk_key":
-				fmt.Printf("%s\n", cfg.VoicePushToTalkKey)
-			case "whisper_model_path":
-				fmt.Printf("%s\n", cfg.WhisperModelPath)
 			case "llm_provider":
 				fmt.Printf("%s\n", providerOrDefault(cfg.LLMProvider))
 			case "llm_api_key":
 				fmt.Printf("%s\n", maskKey(cfg.LLMAPIKey))
 			case "llm_model":
 				fmt.Printf("%s\n", cfg.LLMModel)
+			case "goal_timeout_minutes":
+				fmt.Printf("%d\n", cfg.GoalTimeoutMinutes)
+			case "max_tool_iterations":
+				fmt.Printf("%d\n", cfg.MaxToolIterations)
+			case "local_model_num_ctx":
+				if cfg.LocalModelNumCtx > 0 {
+					fmt.Printf("%d\n", cfg.LocalModelNumCtx)
+				} else {
+					fmt.Println("auto (recomputed from hardware at server startup)")
+				}
+			case "local_model_keep_alive":
+				fmt.Printf("%s\n", orDefault(cfg.LocalModelKeepAlive, "30m"))
 			default:
-				return fmt.Errorf("unknown config key %q\nValid keys: autonomy_level, approval_timeout_foreground, approval_timeout_background, voice_enabled, voice_push_to_talk_key, whisper_model_path, llm_provider, llm_api_key, llm_model", key)
+				return fmt.Errorf("unknown config key %q\nRun 'hyperi config get --help' for the list of keys", key)
 			}
 			return nil
 		},
@@ -617,36 +237,6 @@ func buildConfigSetCmd() *cobra.Command {
 				cfg.AutonomyUpdatedAt = time.Now()
 				cfg.AutonomyUpdatedBy = currentUser()
 				fmt.Printf("autonomy_level set to %d (%s)\n", n, config.AutonomyLevelText(n))
-			case "approval_timeout_foreground":
-				n, err := strconv.Atoi(val)
-				if err != nil || n <= 0 {
-					return fmt.Errorf("approval_timeout_foreground must be a positive integer (seconds)")
-				}
-				cfg.ApprovalTimeoutForeground = n
-				fmt.Printf("approval_timeout_foreground set to %ds\n", n)
-			case "approval_timeout_background":
-				n, err := strconv.Atoi(val)
-				if err != nil || n <= 0 {
-					return fmt.Errorf("approval_timeout_background must be a positive integer (seconds)")
-				}
-				cfg.ApprovalTimeoutBackground = n
-				fmt.Printf("approval_timeout_background set to %ds\n", n)
-			case "voice_enabled":
-				switch val {
-				case "true", "1", "yes":
-					cfg.VoiceEnabled = true
-				case "false", "0", "no":
-					cfg.VoiceEnabled = false
-				default:
-					return fmt.Errorf("voice_enabled must be true or false")
-				}
-				fmt.Printf("voice_enabled set to %v\n", cfg.VoiceEnabled)
-			case "voice_push_to_talk_key":
-				cfg.VoicePushToTalkKey = val
-				fmt.Printf("voice_push_to_talk_key set to %q\n", val)
-			case "whisper_model_path":
-				cfg.WhisperModelPath = val
-				fmt.Printf("whisper_model_path set to %q\n", val)
 			case "llm_provider":
 				switch val {
 				case config.ProviderAnthropic, config.ProviderOpenCodeZen:
@@ -662,6 +252,35 @@ func buildConfigSetCmd() *cobra.Command {
 			case "llm_model":
 				cfg.LLMModel = val
 				fmt.Printf("llm_model set to %q\n", val)
+			case "goal_timeout_minutes":
+				n, err := strconv.Atoi(val)
+				if err != nil || n <= 0 {
+					return fmt.Errorf("goal_timeout_minutes must be a positive integer, got %q", val)
+				}
+				cfg.GoalTimeoutMinutes = n
+				fmt.Printf("goal_timeout_minutes set to %d\n", n)
+			case "max_tool_iterations":
+				n, err := strconv.Atoi(val)
+				if err != nil || n <= 0 {
+					return fmt.Errorf("max_tool_iterations must be a positive integer, got %q", val)
+				}
+				cfg.MaxToolIterations = n
+				fmt.Printf("max_tool_iterations set to %d\n", n)
+			case "local_model_num_ctx":
+				if val == "auto" || val == "0" {
+					cfg.LocalModelNumCtx = 0
+					fmt.Println("local_model_num_ctx set to auto")
+				} else {
+					n, err := strconv.Atoi(val)
+					if err != nil || n <= 0 {
+						return fmt.Errorf("local_model_num_ctx must be a positive integer or \"auto\", got %q", val)
+					}
+					cfg.LocalModelNumCtx = n
+					fmt.Printf("local_model_num_ctx set to %d\n", n)
+				}
+			case "local_model_keep_alive":
+				cfg.LocalModelKeepAlive = val
+				fmt.Printf("local_model_keep_alive set to %q\n", val)
 			default:
 				return fmt.Errorf("unknown config key %q", key)
 			}
@@ -683,17 +302,14 @@ func buildConfigShowCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("Config: %s\n\n", defaultConfigPath())
-			fmt.Printf("  autonomy_level              %d  (%s)\n",
+			fmt.Printf("  autonomy_level       %d  (%s)\n",
 				cfg.AutonomyLevel, config.AutonomyLevelText(cfg.AutonomyLevel))
-			fmt.Printf("  approval_timeout_foreground %ds\n", cfg.ApprovalTimeoutForeground)
-			fmt.Printf("  approval_timeout_background %ds\n", cfg.ApprovalTimeoutBackground)
-			fmt.Printf("  voice_enabled               %v\n", cfg.VoiceEnabled)
-			fmt.Printf("  voice_push_to_talk_key      %s\n", cfg.VoicePushToTalkKey)
-			fmt.Printf("  whisper_model_path          %s\n", cfg.WhisperModelPath)
-			fmt.Printf("  whisper_cli_path            %s\n", cfg.WhisperCLIPath)
-			fmt.Printf("  llm_provider                %s\n", providerOrDefault(cfg.LLMProvider))
-			fmt.Printf("  llm_api_key                 %s\n", maskKey(cfg.LLMAPIKey))
-			fmt.Printf("  llm_model                   %s\n", cfg.LLMModel)
+			fmt.Printf("  llm_provider         %s\n", providerOrDefault(cfg.LLMProvider))
+			fmt.Printf("  llm_api_key          %s\n", maskKey(cfg.LLMAPIKey))
+			fmt.Printf("  llm_model            %s\n", cfg.LLMModel)
+			fmt.Printf("  goal_timeout_minutes %d\n", cfg.GoalTimeoutMinutes)
+			fmt.Printf("  max_tool_iterations  %d\n", cfg.MaxToolIterations)
+			fmt.Println("\n  (local model settings: see 'hyperi models status')")
 			if !cfg.AutonomyUpdatedAt.IsZero() {
 				fmt.Printf("\n  autonomy last changed by %s at %s\n",
 					cfg.AutonomyUpdatedBy,
@@ -715,403 +331,6 @@ func buildVersionCmd() *cobra.Command {
 			fmt.Printf("hyperi %s\n", version)
 		},
 	}
-}
-
-// ── templates command ─────────────────────────────────────────────────────────
-
-func buildTemplatesCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "templates",
-		Short: "Manage intent templates",
-	}
-	cmd.AddCommand(buildTemplatesGenerateCmd())
-	cmd.AddCommand(buildTemplatesPendingCmd())
-	cmd.AddCommand(buildTemplatesApproveCmd())
-	cmd.AddCommand(buildTemplatesRejectCmd())
-	cmd.AddCommand(buildTemplatesStatsCmd())
-	cmd.AddCommand(buildTemplatesTuneCmd())
-	cmd.AddCommand(buildTemplatesRetireCmd())
-	cmd.AddCommand(buildTemplatesPromoteCmd())
-	return cmd
-}
-
-func buildTemplatesGenerateCmd() *cobra.Command {
-	var cfgPath string
-
-	return &cobra.Command{
-		Use:   "generate",
-		Short: "Generate templates from cached plans",
-		Long: `Analyze cached plans and extract reusable templates from clusters
-of similar intent→plan mappings. Generated templates are either auto-deployed
-(if autonomy_level >= 4) or saved to pending for review.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			cachePath := filepath.Join(dataDir, "cache", "plans.json")
-			pc := cache.New(cache.Config{Path: cachePath})
-
-			templatePath := findRepoTemplates()
-			tr, err := router.NewTemplateRegistry(templatePath)
-			if err != nil {
-				return fmt.Errorf("load templates: %w", err)
-			}
-
-			gc := router.GeneratorConfigFrom(cfg, dataDir)
-			gen := router.NewGenerator(gc, pc, tr)
-
-			templates, err := gen.Run()
-			if err != nil {
-				return fmt.Errorf("generate templates: %w", err)
-			}
-
-			if len(templates) == 0 {
-				fmt.Println("No templates generated. Need more similar cached plans.")
-				return nil
-			}
-
-			for _, t := range templates {
-				if gc.AutoApprove {
-					if err := gen.AutoDeploy(t); err != nil {
-						return fmt.Errorf("deploy template %s: %w", t.Name, err)
-					}
-					fmt.Printf("[DEPLOYED] %s — %d sources, confidence %.1f\n", t.Name, t.SourceCount, t.Confidence)
-				} else {
-					if err := gen.SavePending(t); err != nil {
-						return fmt.Errorf("save pending template %s: %w", t.Name, err)
-					}
-					fmt.Printf("[PENDING] %s — %d sources, confidence %.1f\n", t.Name, t.SourceCount, t.Confidence)
-				}
-				fmt.Printf("  Patterns: %s\n", strings.Join(t.Patterns, ", "))
-				fmt.Printf("  Intents:  %s\n", strings.Join(t.SourceIntents, ", "))
-			}
-
-			return nil
-		},
-	}
-}
-
-func buildTemplatesPendingCmd() *cobra.Command {
-	var cfgPath string
-
-	return &cobra.Command{
-		Use:   "pending",
-		Short: "List pending auto-generated templates",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			gc := router.GeneratorConfigFrom(cfg, dataDir)
-			tr, _ := router.NewTemplateRegistry("")
-			gen := router.NewGenerator(gc, nil, tr)
-
-			pending, err := gen.ListPending()
-			if err != nil {
-				return fmt.Errorf("list pending: %w", err)
-			}
-
-			if len(pending) == 0 {
-				fmt.Println("No pending templates.")
-				return nil
-			}
-
-			fmt.Printf("%-30s  %-8s  %-10s  %s\n", "NAME", "SOURCES", "CONFIDENCE", "GENERATED")
-			fmt.Println(strings.Repeat("─", 80))
-			for _, t := range pending {
-				fmt.Printf("%-30s  %-8d  %-10.1f  %s\n",
-					t.Name,
-					t.SourceCount,
-					t.Confidence,
-					t.GeneratedAt.Format("2006-01-02 15:04:05"),
-				)
-			}
-			fmt.Printf("\nPending file: %s\n", gc.PendingPath)
-			fmt.Println("Use 'hyperi templates approve <name>' to deploy.")
-			return nil
-		},
-	}
-}
-
-func buildTemplatesApproveCmd() *cobra.Command {
-	var cfgPath string
-
-	return &cobra.Command{
-		Use:   "approve <name>",
-		Short: "Approve and deploy a pending template",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			gc := router.GeneratorConfigFrom(cfg, dataDir)
-			tr, _ := router.NewTemplateRegistry("")
-			gen := router.NewGenerator(gc, nil, tr)
-
-			name := args[0]
-			if err := gen.Approve(name); err != nil {
-				return err
-			}
-
-			fmt.Printf("Template %q approved and deployed.\n", name)
-			return nil
-		},
-	}
-}
-
-func buildTemplatesRejectCmd() *cobra.Command {
-	var cfgPath string
-
-	return &cobra.Command{
-		Use:   "reject <name>",
-		Short: "Reject and delete a pending template",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			gc := router.GeneratorConfigFrom(cfg, dataDir)
-			tr, _ := router.NewTemplateRegistry("")
-			gen := router.NewGenerator(gc, nil, tr)
-
-			name := args[0]
-			if err := gen.Reject(name); err != nil {
-				return err
-			}
-
-			fmt.Printf("Template %q rejected and deleted.\n", name)
-			return nil
-		},
-	}
-}
-
-func buildTemplatesStatsCmd() *cobra.Command {
-	var cfgPath string
-
-	return &cobra.Command{
-		Use:   "stats",
-		Short: "Show generator metrics and template performance",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			metricsPath := filepath.Join(dataDir, "cache", "template_metrics.json")
-			retiredPath := filepath.Join(dataDir, "cache", "retired_templates.yaml")
-			gc := router.GeneratorConfigFrom(cfg, dataDir)
-			tr, _ := router.NewTemplateRegistry("")
-			gen := router.NewGeneratorWithMetrics(gc, nil, tr, metricsPath, retiredPath)
-
-			metrics := gen.GetGeneratorMetrics()
-			tmplMetrics := gen.GetAllTemplateMetrics()
-
-			fmt.Printf("Generator Metrics\n")
-			fmt.Printf("  Total templates:     %d\n", metrics.TotalTemplates)
-			fmt.Printf("  Active templates:    %d\n", metrics.ActiveTemplates)
-			fmt.Printf("  Retired templates:   %d\n", metrics.RetiredTemplates)
-			fmt.Printf("  Total hits:          %d\n", metrics.TotalHits)
-			fmt.Printf("  Hit rate:            %.4f\n", metrics.HitRate)
-			fmt.Printf("  False positive rate: %.4f\n", metrics.FalsePositiveRate)
-			fmt.Printf("  Pending templates:   %d\n", metrics.PendingCount)
-			fmt.Printf("  Min cluster size:    %d\n", gc.MinClusterSize)
-			fmt.Printf("  Min success rate:    %.2f\n", gc.MinSuccessRate)
-			if !metrics.LastRun.IsZero() {
-				fmt.Printf("  Last tuning run:     %s\n", metrics.LastRun.Format("2006-01-02 15:04:05"))
-			}
-
-			if len(tmplMetrics) > 0 {
-				fmt.Printf("\nTemplate Performance\n")
-				fmt.Printf("%-30s  %-8s  %-8s  %-8s  %-8s  %-10s  %s\n", "NAME", "HITS", "EXEC", "SUCCESS", "FAIL", "FP RATE", "STATUS")
-				fmt.Println(strings.Repeat("─", 90))
-				for _, tm := range tmplMetrics {
-					fpRate := 0.0
-					if tm.HitCount > 0 {
-						fpRate = float64(tm.FalsePositives) / float64(tm.HitCount)
-					}
-					fmt.Printf("%-30s  %-8d  %-8d  %-8d  %-8d  %-10.2f  %s\n",
-						tm.Name, tm.HitCount, tm.ExecCount, tm.SuccessCount, tm.FailCount, fpRate, tm.Status,
-					)
-				}
-			}
-
-			return nil
-		},
-	}
-}
-
-func buildTemplatesTuneCmd() *cobra.Command {
-	var cfgPath string
-
-	return &cobra.Command{
-		Use:   "tune",
-		Short: "Run self-tuning cycle manually",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			metricsPath := filepath.Join(dataDir, "cache", "template_metrics.json")
-			retiredPath := filepath.Join(dataDir, "cache", "retired_templates.yaml")
-			gc := router.GeneratorConfigFrom(cfg, dataDir)
-			tr, _ := router.NewTemplateRegistry("")
-			gen := router.NewGeneratorWithMetrics(gc, nil, tr, metricsPath, retiredPath)
-
-			if err := gen.SelfTune(); err != nil {
-				fmt.Printf("Self-tuning result: %v\n", err)
-				return nil
-			}
-
-			metrics := gen.GetGeneratorMetrics()
-			fmt.Printf("Self-tuning complete.\n")
-			fmt.Printf("  Min cluster size: %d\n", gc.MinClusterSize)
-			fmt.Printf("  Min success rate: %.2f\n", gc.MinSuccessRate)
-			fmt.Printf("  Active templates: %d\n", metrics.ActiveTemplates)
-
-			return nil
-		},
-	}
-}
-
-func buildTemplatesRetireCmd() *cobra.Command {
-	var cfgPath string
-
-	return &cobra.Command{
-		Use:   "retire <name>",
-		Short: "Manually retire a template",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			metricsPath := filepath.Join(dataDir, "cache", "template_metrics.json")
-			retiredPath := filepath.Join(dataDir, "cache", "retired_templates.yaml")
-			gc := router.GeneratorConfigFrom(cfg, dataDir)
-			tr, _ := router.NewTemplateRegistry("")
-			gen := router.NewGeneratorWithMetrics(gc, nil, tr, metricsPath, retiredPath)
-
-			name := args[0]
-			if err := gen.RetireTemplate(name); err != nil {
-				return err
-			}
-
-			fmt.Printf("Template %q retired.\n", name)
-			return nil
-		},
-	}
-}
-
-func buildTemplatesPromoteCmd() *cobra.Command {
-	var cfgPath string
-
-	return &cobra.Command{
-		Use:   "promote <name>",
-		Short: "Manually promote a template to trusted",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(cfgPath)
-			if err != nil {
-				return err
-			}
-
-			dataDir := resolveDataDir()
-			metricsPath := filepath.Join(dataDir, "cache", "template_metrics.json")
-			retiredPath := filepath.Join(dataDir, "cache", "retired_templates.yaml")
-			gc := router.GeneratorConfigFrom(cfg, dataDir)
-			tr, _ := router.NewTemplateRegistry("")
-			gen := router.NewGeneratorWithMetrics(gc, nil, tr, metricsPath, retiredPath)
-
-			name := args[0]
-			if err := gen.PromoteTemplate(name); err != nil {
-				return err
-			}
-
-			fmt.Printf("Template %q promoted to trusted.\n", name)
-			return nil
-		},
-	}
-}
-
-// ── Headless pipeline runner ──────────────────────────────────────────────────
-
-// runHeadless runs the full pipeline without the TUI. Used by
-// `hyperi session start --no-tui` and the systemd service (Phase 0/1).
-func runHeadless(cfg *config.Config, intent string, execute bool) error {
-	infra, err := bootstrap(cfg)
-	if err != nil {
-		return err
-	}
-	defer infra.sched.Stop()
-	defer infra.notifier.Close()
-
-	infra.notifier.SetAuditCallback(infra.auditLog.Log)
-
-	if intent == "" {
-		return fmt.Errorf("intent is required in --no-tui mode")
-	}
-
-	if !execute {
-		cfg.AutonomyLevel = config.AutonomyObserve
-	}
-
-	pipelineRunner := shell.NewPipelineRunner(shell.RunnerConfig{
-		APIKey:        infra.apiKey,
-		AutonomyLevel: cfg.AutonomyLevel,
-		ExecutorType:  "local",
-		Notifier:      infra.notifier,
-		Registry:      infra.registry,
-		Validator:     infra.validator,
-		Manifest:      infra.manifestSt,
-		SessionMgr:    infra.sessionMgr,
-		AuditLogger:   infra.auditLog,
-		Config:        infra.cfg,
-		DataPathFn:    infra.dataPathFn,
-		WorkspaceDir:  infra.workDir,
-	})
-
-	templatePath := findRepoTemplates()
-	ir := router.New(router.Config{
-		CachePath:     infra.dataPathFn("cache/plans.json"),
-		TemplatePath:  templatePath,
-		StatsPath:     infra.dataPathFn("cache/stats.json"),
-		Fallback:      func(ctx context.Context, intent, _ string) error { return pipelineRunner(ctx, intent, "") },
-		Registry:      infra.registry,
-		Validator:     infra.validator,
-		Notifier:      infra.notifier,
-		SessionID:     "headless",
-		AutonomyLevel: cfg.AutonomyLevel,
-		WorkspaceDir:  infra.workDir,
-	})
-
-	return ir.Route(context.Background(), intent)
-}
-
-// launchShellWithIntent opens the TUI shell with an intent pre-queued.
-// The intent is submitted automatically as the first command after the TUI
-// is ready. "__resume__:<sessionID>" intents are passed directly to the
-// pipeline runner which handles them via resumeFromPlanDoc().
-func launchShellWithIntent(cfg *config.Config, intent string, _ bool) error {
-	if intent != "" {
-		os.Setenv("HYPERI_INITIAL_INTENT", intent)
-	}
-	return launchShell(cfg)
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -1149,73 +368,6 @@ func defaultConfigPath() string {
 	return filepath.Join(resolveDataDir(), "config.json")
 }
 
-// findRepoAllowlist returns the path to the bundled config/allowlist.yaml by
-// searching from the executable location and known install paths.
-// Returns "" if not found.
-func findRepoAllowlist() string {
-	candidates := []string{
-		"config/allowlist.yaml",
-		"/opt/hyperios/config/allowlist.yaml",
-		func() string {
-			exe, err := os.Executable()
-			if err != nil {
-				return ""
-			}
-			exe, _ = filepath.EvalSymlinks(exe)
-			dir := filepath.Dir(exe)
-			for i := 0; i < 3; i++ {
-				candidate := filepath.Join(dir, "config", "allowlist.yaml")
-				if _, err := os.Stat(candidate); err == nil {
-					return candidate
-				}
-				dir = filepath.Dir(dir)
-			}
-			return ""
-		}(),
-	}
-	for _, c := range candidates {
-		if c == "" {
-			continue
-		}
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
-	}
-	return ""
-}
-
-func findRepoTemplates() string {
-	candidates := []string{
-		"config/templates.yaml",
-		"/opt/hyperios/config/templates.yaml",
-		func() string {
-			exe, err := os.Executable()
-			if err != nil {
-				return ""
-			}
-			exe, _ = filepath.EvalSymlinks(exe)
-			dir := filepath.Dir(exe)
-			for i := 0; i < 3; i++ {
-				candidate := filepath.Join(dir, "config", "templates.yaml")
-				if _, err := os.Stat(candidate); err == nil {
-					return candidate
-				}
-				dir = filepath.Dir(dir)
-			}
-			return ""
-		}(),
-	}
-	for _, c := range candidates {
-		if c == "" {
-			continue
-		}
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
-	}
-	return ""
-}
-
 // loadConfig loads the runtime config from the given path, or auto-detects it.
 func loadConfig(path string) (*config.Config, error) {
 	if path == "" {
@@ -1243,15 +395,6 @@ func resolveAPIKey(cfg *config.Config) string {
 
 // ── Misc utilities ────────────────────────────────────────────────────────────
 
-// rotateAuditLog renames audit.jsonl → audit-<date>.jsonl.
-func rotateAuditLog(path string) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return
-	}
-	dest := strings.TrimSuffix(path, ".jsonl") + "-" + time.Now().Format("2006-01-02") + ".jsonl"
-	_ = os.Rename(path, dest)
-}
-
 // currentUser returns the current OS username, or "unknown".
 func currentUser() string {
 	if u := os.Getenv("USER"); u != "" {
@@ -1261,13 +404,4 @@ func currentUser() string {
 		return u
 	}
 	return "unknown"
-}
-
-// truncate shortens s to max runes, appending "…" if truncated.
-func truncate(s string, max int) string {
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	return string(runes[:max-1]) + "…"
 }

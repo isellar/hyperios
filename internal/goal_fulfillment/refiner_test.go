@@ -42,6 +42,44 @@ func TestRefiner_RefineGoal_ActivatesGoal(t *testing.T) {
 	}
 }
 
+// TestRefiner_RefineGoal_PreservesOriginalID is a regression test: the
+// refiner system prompt's schema example shows a literal "id": "g1", and the
+// LLM copies that literally into its response rather than echoing back the
+// real goal ID. If the refiner trusted resp.Goals[0].ID, the tracked goal
+// would silently change ID on every successful refinement — orphaning the
+// original (e.g. right after answering a clarification question, where the
+// user expects the SAME goal to proceed, not a new one appearing under a
+// different ID).
+func TestRefiner_RefineGoal_PreservesOriginalID(t *testing.T) {
+	resp := `{
+		"intent": "install nginx",
+		"context": "",
+		"goals": [
+			{"id": "g1", "description": "install nginx package", "depends_on": []}
+		],
+		"clarification_needed": false,
+		"clarification_question": ""
+	}`
+	client := &mockCompleter{response: resp}
+	r := NewRefiner(client, nil, nil)
+
+	goal := &types.Goal{
+		ID:          "g-1234567890-1", // realistic production-style ID, NOT "g1"
+		Description: "install nginx",
+		State:       types.GoalStateRefining,
+		CreatedAt:   time.Now(),
+	}
+
+	refined, err := r.RefineGoal(context.Background(), goal)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if refined.ID != "g-1234567890-1" {
+		t.Errorf("expected original goal ID to be preserved, got %q (LLM's fake ID leaked through)", refined.ID)
+	}
+}
+
 func TestRefiner_RefineGoal_ClarificationNeeded(t *testing.T) {
 	resp := `{
 		"intent": "fix the thing",

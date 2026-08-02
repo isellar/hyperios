@@ -9,6 +9,7 @@ import (
 	"github.com/isellar/hyperios/internal/io_toolbox/tools"
 	"github.com/isellar/hyperios/internal/module"
 	"github.com/isellar/hyperios/internal/scheduler"
+	"github.com/isellar/hyperios/internal/selfmodify"
 )
 
 // IOToolbox is a module that exposes a set of I/O tools to agents.
@@ -42,9 +43,35 @@ func NewIOToolbox(cfg *config.Config) *IOToolbox {
 	return tb
 }
 
+// EnableSelfModify registers the "self_modify" tool backed by mgr, letting
+// agents rebuild/verify/apply changes to HyperiOS's own source tree. Not
+// called by NewIOToolbox — only wired when the user has explicitly opted in
+// (see cmd/hyperi's 'hyperi selfmodify enable' and buildLLMClient/wiring.go).
+// Calling this again with a new mgr replaces the previous registration.
+func (tb *IOToolbox) EnableSelfModify(mgr *selfmodify.Manager) {
+	tb.registry.Register(tools.NewSelfModifyTool(mgr))
+}
+
+// DisableSelfModify removes the "self_modify" tool from the registry, if
+// present. Safe to call even if it was never registered.
+func (tb *IOToolbox) DisableSelfModify() {
+	tb.registry.Remove("self_modify")
+}
+
 // GetTool returns the named tool from the registry.
 func (tb *IOToolbox) GetTool(name string) (Tool, bool) {
 	return tb.registry.Get(name)
+}
+
+// DescribeTool returns the human-readable description for a registered tool,
+// or ("", false) if no tool with that name is registered. Satisfies the
+// processor.ToolCaller interface.
+func (tb *IOToolbox) DescribeTool(name string) (string, bool) {
+	t, ok := tb.registry.Get(name)
+	if !ok {
+		return "", false
+	}
+	return t.Description(), true
 }
 
 // ListTools returns the names of all registered tools.

@@ -10,7 +10,6 @@ import (
 
 	"github.com/isellar/hyperios/internal/audit"
 	"github.com/isellar/hyperios/internal/config"
-	"github.com/isellar/hyperios/internal/governor"
 	"github.com/isellar/hyperios/internal/llm"
 	"github.com/isellar/hyperios/internal/memory"
 	"github.com/isellar/hyperios/internal/types"
@@ -167,7 +166,8 @@ func newMockAudit(t *testing.T) *audit.Logger {
 // ---------------------------------------------------------------------------
 
 type mockMemoryQuerier struct {
-	entries map[string]string
+	entries    map[string]string
+	directives []types.Directive
 }
 
 func newMockMemoryQuerier() *mockMemoryQuerier {
@@ -190,24 +190,8 @@ func (m *mockMemoryQuerier) SearchContext(query string) ([]*memory.MemoryEntry, 
 	return results, nil
 }
 
-// ---------------------------------------------------------------------------
-// mockGovernorReviewer — satisfies processor.GovernorReviewer for processor tests.
-// ---------------------------------------------------------------------------
-
-type mockGovernorReviewer struct {
-	approved bool
-	reason   string
-}
-
-func (m *mockGovernorReviewer) ReviewGoal(goal *types.Goal) (*governor.ReviewResult, error) {
-	return &governor.ReviewResult{
-		Approved: m.approved,
-		Reason:   m.reason,
-	}, nil
-}
-
-func (m *mockGovernorReviewer) CheckToolAuthorized(toolID string) bool {
-	return m.approved
+func (m *mockMemoryQuerier) ListDirectives() ([]types.Directive, error) {
+	return m.directives, nil
 }
 
 // ---------------------------------------------------------------------------

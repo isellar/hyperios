@@ -2,6 +2,7 @@ package goal_fulfillment
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -50,15 +51,59 @@ func (gf *GoalFulfillment) SubmitGoal(description string) (*types.Goal, error) {
 
 func (gf *GoalFulfillment) RefineGoal(ctx context.Context, goal *types.Goal) (*types.Goal, error) {
 	refined, err := gf.refiner.RefineGoal(ctx, goal)
-	if err != nil {
+
+	// A ClarificationNeededError still carries a usable goal (the refiner
+	// sets ClarificationQuestion/NeedsAttention on it before returning) —
+	// persist it so the question survives and is visible via the API/UI,
+	// rather than discarding it and leaving the goal stuck with no
+	// indication of why. Only a true refinement failure (LLM error, bad
+	// JSON) should drop the goal without tracking it.
+	var clarErr *ClarificationNeededError
+	if err != nil && !errors.As(err, &clarErr) {
 		return nil, fmt.Errorf("goal_fulfillment: refine: %w", err)
 	}
 
-	if err := gf.tracker.TrackGoal(refined); err != nil {
-		return nil, fmt.Errorf("goal_fulfillment: track refined goal: %w", err)
+	if trackErr := gf.tracker.TrackGoal(refined); trackErr != nil {
+		return nil, fmt.Errorf("goal_fulfillment: track refined goal: %w", trackErr)
 	}
 
+	if err != nil {
+		// Propagate the ClarificationNeededError so callers (e.g. the API
+		// handler) can distinguish "needs input, but was saved" from a
+		// hard failure — they still get the persisted goal via GetGoal.
+		return refined, err
+	}
 	return refined, nil
+}
+
+// AnswerGoal responds to a pending clarification question on goal id, folding
+// the answer into the goal's description and clearing the "needs attention"
+// state. It does NOT re-run refinement or queue the goal for execution —
+// callers (see apiserver.handleAnswerGoal) are expected to call RefineGoal
+// and Processor.QueueGoal afterward, exactly as they would for a freshly
+// submitted goal, since answering a question is really just "try refining
+// again with more information."
+func (gf *GoalFulfillment) AnswerGoal(id, answer string) (*types.Goal, error) {
+	goal, err := gf.tracker.GetGoal(id)
+	if err != nil {
+		return nil, fmt.Errorf("goal_fulfillment: answer goal: %w", err)
+	}
+	if goal.ClarificationQuestion == "" {
+		return nil, fmt.Errorf("goal_fulfillment: goal %q has no pending clarification question", id)
+	}
+
+	goal.Description = fmt.Sprintf(
+		"%s\n\n(Previously asked: %q — Answer: %s)",
+		goal.Description, goal.ClarificationQuestion, answer,
+	)
+	goal.ClarificationQuestion = ""
+	goal.NeedsAttention = false
+	goal.UpdatedAt = time.Now()
+
+	if err := gf.tracker.TrackGoal(goal); err != nil {
+		return nil, fmt.Errorf("goal_fulfillment: track answered goal: %w", err)
+	}
+	return goal, nil
 }
 
 func (gf *GoalFulfillment) BreakdownGoal(ctx context.Context, goal *types.Goal) ([]*types.Goal, error) {
@@ -90,6 +135,13 @@ func (gf *GoalFulfillment) ListGoals(state types.GoalState) ([]*types.Goal, erro
 
 func (gf *GoalFulfillment) UpdateGoalState(id string, state types.GoalState) error {
 	return gf.tracker.UpdateGoalState(id, state)
+}
+
+// DeleteGoal permanently removes a goal from tracking. Used by the UI/API to
+// let the user dismiss stale or orphaned goals (e.g. goals stuck in
+// "refining" from before a bug fix, with no path forward).
+func (gf *GoalFulfillment) DeleteGoal(id string) error {
+	return gf.tracker.DeleteGoal(id)
 }
 
 func (gf *GoalFulfillment) Name() string {

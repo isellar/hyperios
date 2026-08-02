@@ -49,6 +49,14 @@ func (r *ToolRegistry) Get(name string) (Tool, bool) {
 	return t, ok
 }
 
+// Remove deletes the named tool from the registry, if present. A no-op if
+// the tool was never registered.
+func (r *ToolRegistry) Remove(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.tools, name)
+}
+
 // List returns the names of all registered tools in sorted order.
 func (r *ToolRegistry) List() []string {
 	r.mu.RLock()

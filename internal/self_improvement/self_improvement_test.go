@@ -52,6 +52,20 @@ func (m *mockGoalSubmitter) SubmitGoal(description string) (*types.Goal, error) 
 	}, nil
 }
 
+// mockDirectiveStore satisfies DirectiveStore for testing.
+type mockDirectiveStore struct {
+	added []types.Directive
+	err   error
+}
+
+func (m *mockDirectiveStore) AddDirective(d types.Directive) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.added = append(m.added, d)
+	return nil
+}
+
 // ── Stats tests ───────────────────────────────────────────────────────────────
 
 func TestStats_RecordGoalResult_Success(t *testing.T) {
@@ -251,6 +265,152 @@ func TestSelfImprovement_Analyze_SubmitsImprovementGoals(t *testing.T) {
 	}
 	if gs.submitted[1] != "improve error messages" {
 		t.Errorf("submitted[1]: got %q", gs.submitted[1])
+	}
+}
+
+// TestSelfImprovement_Analyze_PersistsDirectives verifies that
+// analysis.Directives are persisted via DirectiveStore.AddDirective.
+func TestSelfImprovement_Analyze_PersistsDirectives(t *testing.T) {
+	analysisResp := Analysis{
+		Patterns: []string{"agent repeatedly ran out of disk space mid-write"},
+		Directives: []DirectiveSuggestion{
+			{Description: "always check available disk space before writing files larger than 100MB", Priority: 7},
+		},
+	}
+	respJSON, _ := json.Marshal(analysisResp)
+
+	mc := &mockCompleter{response: string(respJSON)}
+	si := newTestSelfImprovement(mc)
+	gs := &mockGoalSubmitter{}
+	ds := &mockDirectiveStore{}
+	si.SetGoalFulfillment(gs)
+	si.SetDirectiveStore(ds)
+
+	si.RecordResult(GoalResult{GoalID: "g1", Description: "write large file", Success: false, ErrorMsg: "no space left on device"})
+
+	if err := si.Analyze(); err != nil {
+		t.Fatalf("Analyze() unexpected error: %v", err)
+	}
+
+	if len(ds.added) != 1 {
+		t.Fatalf("expected 1 directive persisted, got %d", len(ds.added))
+	}
+	if ds.added[0].Description != analysisResp.Directives[0].Description {
+		t.Errorf("directive description mismatch: got %q", ds.added[0].Description)
+	}
+	if ds.added[0].Priority != 7 {
+		t.Errorf("directive priority mismatch: got %d, want 7", ds.added[0].Priority)
+	}
+	if ds.added[0].Immutable {
+		t.Error("learned directives should not be Immutable")
+	}
+	if ds.added[0].ID == "" {
+		t.Error("expected a non-empty derived directive ID")
+	}
+	// No improvement goals in this analysis — none should be submitted.
+	if len(gs.submitted) != 0 {
+		t.Errorf("expected 0 goals submitted, got %d", len(gs.submitted))
+	}
+}
+
+// TestSelfImprovement_Analyze_BothGoalsAndDirectives verifies both kinds of
+// output can be produced and persisted from a single analysis cycle.
+func TestSelfImprovement_Analyze_BothGoalsAndDirectives(t *testing.T) {
+	analysisResp := Analysis{
+		ImprovementGoals: []string{"install missing 'jq' dependency"},
+		Directives:       []DirectiveSuggestion{{Description: "prefer apt over manual builds", Priority: 3}},
+	}
+	respJSON, _ := json.Marshal(analysisResp)
+
+	mc := &mockCompleter{response: string(respJSON)}
+	si := newTestSelfImprovement(mc)
+	gs := &mockGoalSubmitter{}
+	ds := &mockDirectiveStore{}
+	si.SetGoalFulfillment(gs)
+	si.SetDirectiveStore(ds)
+
+	si.RecordResult(GoalResult{GoalID: "g1", Description: "task", Success: false})
+
+	if err := si.Analyze(); err != nil {
+		t.Fatalf("Analyze() unexpected error: %v", err)
+	}
+
+	if len(gs.submitted) != 1 {
+		t.Errorf("expected 1 goal submitted, got %d", len(gs.submitted))
+	}
+	if len(ds.added) != 1 {
+		t.Errorf("expected 1 directive persisted, got %d", len(ds.added))
+	}
+}
+
+// TestSelfImprovement_Analyze_NeitherGoalsNorDirectives verifies that an
+// analysis with both arrays empty is a legitimate, error-free outcome (not
+// every analysis cycle needs to produce something).
+func TestSelfImprovement_Analyze_NeitherGoalsNorDirectives(t *testing.T) {
+	analysisResp := Analysis{Patterns: []string{}, Suggestions: []string{}}
+	respJSON, _ := json.Marshal(analysisResp)
+
+	mc := &mockCompleter{response: string(respJSON)}
+	si := newTestSelfImprovement(mc)
+	gs := &mockGoalSubmitter{}
+	ds := &mockDirectiveStore{}
+	si.SetGoalFulfillment(gs)
+	si.SetDirectiveStore(ds)
+
+	si.RecordResult(GoalResult{GoalID: "g1", Description: "task", Success: true})
+
+	if err := si.Analyze(); err != nil {
+		t.Fatalf("Analyze() unexpected error: %v", err)
+	}
+	if len(gs.submitted) != 0 || len(ds.added) != 0 {
+		t.Errorf("expected no goals/directives, got %d goals, %d directives", len(gs.submitted), len(ds.added))
+	}
+}
+
+// TestSelfImprovement_Analyze_NoDirectiveStore verifies Analyze still
+// succeeds (for the goals path) when no DirectiveStore is wired — directive
+// persistence is silently skipped rather than treated as an error.
+func TestSelfImprovement_Analyze_NoDirectiveStore(t *testing.T) {
+	analysisResp := Analysis{
+		Directives: []DirectiveSuggestion{{Description: "some rule", Priority: 1}},
+	}
+	respJSON, _ := json.Marshal(analysisResp)
+
+	mc := &mockCompleter{response: string(respJSON)}
+	si := newTestSelfImprovement(mc)
+	gs := &mockGoalSubmitter{}
+	si.SetGoalFulfillment(gs)
+	// No SetDirectiveStore call.
+
+	si.RecordResult(GoalResult{GoalID: "g1", Description: "task", Success: false})
+
+	if err := si.Analyze(); err != nil {
+		t.Fatalf("Analyze() unexpected error with no DirectiveStore: %v", err)
+	}
+}
+
+// TestSelfImprovement_Analyze_DirectiveStoreError verifies a
+// directive-persistence failure is collected as a partial error (mirroring
+// the existing GoalSubmitter error-collection behavior) rather than
+// silently swallowed or fatal to the whole cycle.
+func TestSelfImprovement_Analyze_DirectiveStoreError(t *testing.T) {
+	analysisResp := Analysis{
+		Directives: []DirectiveSuggestion{{Description: "some rule", Priority: 1}},
+	}
+	respJSON, _ := json.Marshal(analysisResp)
+
+	mc := &mockCompleter{response: string(respJSON)}
+	si := newTestSelfImprovement(mc)
+	gs := &mockGoalSubmitter{}
+	ds := &mockDirectiveStore{err: errTest("disk full")}
+	si.SetGoalFulfillment(gs)
+	si.SetDirectiveStore(ds)
+
+	si.RecordResult(GoalResult{GoalID: "g1", Description: "task", Success: false})
+
+	err := si.Analyze()
+	if err == nil {
+		t.Error("Analyze(): expected error when DirectiveStore fails")
 	}
 }
 

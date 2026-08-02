@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,15 +23,52 @@ type MemoryEntry struct {
 // LongTermMemory provides disk-backed key/value storage for the agent.
 // Each entry is persisted as an individual JSON file under storagePath.
 // The directory is created lazily on first write.
+//
+// Search relevance is served by an in-memory inverted index (index.go)
+// rather than rescanning every file on disk for every call. The index is
+// built lazily on first use (loaded once from whatever is already on disk)
+// and then kept incrementally in sync by Store/Forget — no full rescan is
+// needed again unless the process restarts.
 type LongTermMemory struct {
-	mu          sync.RWMutex
+	mu          sync.Mutex
 	storagePath string
+	idx         *invertedIndex
+	loaded      bool
+	// entries caches the fully-parsed entry for every indexed key, keyed by
+	// the original (unsanitised) key, so Search can resolve index hits back
+	// to *MemoryEntry without a per-entry disk read.
+	entries map[string]*MemoryEntry
 }
 
 // newLongTermMemory creates a LongTermMemory backed by storagePath.
 // The directory is created when the first entry is stored.
 func newLongTermMemory(storagePath string) *LongTermMemory {
-	return &LongTermMemory{storagePath: storagePath}
+	return &LongTermMemory{
+		storagePath: storagePath,
+		idx:         newInvertedIndex(),
+		entries:     make(map[string]*MemoryEntry),
+	}
+}
+
+// ensureLoadedLocked populates the in-memory index and entry cache from
+// disk on first use. The caller must hold lt.mu. Subsequent calls are a
+// no-op (the index is kept in sync incrementally by Store/Forget from then
+// on, so there's no need to ever rescan the whole directory again within
+// the same process lifetime).
+func (lt *LongTermMemory) ensureLoadedLocked() error {
+	if lt.loaded {
+		return nil
+	}
+	all, err := lt.loadAll()
+	if err != nil {
+		return err
+	}
+	for _, e := range all {
+		lt.entries[e.Key] = e
+		lt.idx.add(e.Key, tokenize(documentText(e)))
+	}
+	lt.loaded = true
+	return nil
 }
 
 // entryPath returns the filesystem path for a given key.
@@ -63,6 +101,13 @@ func (lt *LongTermMemory) Store(key string, value interface{}, tags []string) er
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 
+	// Load whatever's already on disk before applying this write, so the
+	// in-memory index reflects the full corpus rather than just entries
+	// written since process start.
+	if err := lt.ensureLoadedLocked(); err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(lt.storagePath, 0o750); err != nil {
 		return fmt.Errorf("memory: create storage dir: %w", err)
 	}
@@ -89,6 +134,11 @@ func (lt *LongTermMemory) Store(key string, value interface{}, tags []string) er
 		_ = os.Remove(tmp)
 		return fmt.Errorf("memory: rename entry %q: %w", key, err)
 	}
+
+	// Keep the in-memory index/cache in sync with what's now on disk,
+	// rather than requiring a reload on the next Search call.
+	lt.entries[key] = entry
+	lt.idx.update(key, tokenize(documentText(entry)))
 
 	return nil
 }
@@ -122,48 +172,107 @@ func (lt *LongTermMemory) Recall(key string) (*MemoryEntry, error) {
 		}
 	}
 
+	// Keep the cache consistent if this key is (or becomes) tracked. Token
+	// content (key/value/tags) is unchanged by a recall, so the index
+	// itself doesn't need updating — only the cached entry's LastAccessed.
+	if lt.loaded {
+		lt.entries[key] = &entry
+	}
+
 	return &entry, nil
 }
 
-// Search performs a simple case-insensitive substring match across all stored
-// keys, values (JSON-serialised), and tags.
-// Returns all entries where query appears in any of those fields.
+// Search returns entries relevant to query, ranked by BM25 relevance score
+// (highest first) rather than the arbitrary filesystem-listing order of the
+// previous substring-based implementation. query is tokenized into words
+// (see tokenize); an entry's score depends on how many query terms it
+// contains, weighted by how distinctive each term is across the whole
+// corpus (rarer terms count for more) and normalized for document length,
+// so a long entry that happens to mention a common word once doesn't
+// outrank a short, highly relevant one.
+//
+// An empty query is treated as "return every entry" (used e.g. by
+// Memory.Report to count total entries), with no ranking applied since
+// there's nothing to rank against.
 func (lt *LongTermMemory) Search(query string) ([]*MemoryEntry, error) {
-	lt.mu.RLock()
-	defer lt.mu.RUnlock()
+	return lt.SearchTopN(query, 0)
+}
 
-	entries, err := lt.loadAll()
-	if err != nil {
+// SearchTopN is like Search but returns at most limit results (the
+// highest-scoring ones). limit <= 0 means unbounded, matching Search.
+func (lt *LongTermMemory) SearchTopN(query string, limit int) ([]*MemoryEntry, error) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+
+	if err := lt.ensureLoadedLocked(); err != nil {
 		return nil, err
 	}
 
-	q := strings.ToLower(query)
-	var results []*MemoryEntry
-	for _, e := range entries {
-		if lt.matches(e, q) {
+	if strings.TrimSpace(query) == "" {
+		results := make([]*MemoryEntry, 0, len(lt.entries))
+		for _, e := range lt.entries {
+			results = append(results, e)
+		}
+		sort.Slice(results, func(i, j int) bool { return results[i].Key < results[j].Key })
+		if limit > 0 && len(results) > limit {
+			results = results[:limit]
+		}
+		return results, nil
+	}
+
+	tokens := tokenize(query)
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+
+	scored := lt.idx.score(tokens)
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		// Stable tie-break so results are deterministic across calls.
+		return scored[i].key < scored[j].key
+	})
+	if limit > 0 && len(scored) > limit {
+		scored = scored[:limit]
+	}
+
+	results := make([]*MemoryEntry, 0, len(scored))
+	for _, sd := range scored {
+		if e, ok := lt.entries[sd.key]; ok {
 			results = append(results, e)
 		}
 	}
 	return results, nil
 }
 
-// matches reports whether the entry matches the lowercased query string.
-func (lt *LongTermMemory) matches(e *MemoryEntry, q string) bool {
-	if strings.Contains(strings.ToLower(e.Key), q) {
-		return true
+// SearchByTag returns every entry that has an exact (case-insensitive) match
+// for tag among its Tags. Unlike Search, this does not rank by relevance —
+// it won't accidentally pull in unrelated entries whose content happens to
+// contain the tag as a word, since it checks the Tags field only — used for
+// directive lookup, where we need "give me exactly the directive-tagged
+// entries" rather than a fuzzy search.
+func (lt *LongTermMemory) SearchByTag(tag string) ([]*MemoryEntry, error) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+
+	if err := lt.ensureLoadedLocked(); err != nil {
+		return nil, err
 	}
-	// Serialise value to JSON for substring matching
-	if vb, err := json.Marshal(e.Value); err == nil {
-		if strings.Contains(strings.ToLower(string(vb)), q) {
-			return true
+
+	tagLower := strings.ToLower(tag)
+	var results []*MemoryEntry
+	for _, e := range lt.entries {
+		for _, t := range e.Tags {
+			if strings.ToLower(t) == tagLower {
+				results = append(results, e)
+				break
+			}
 		}
 	}
-	for _, tag := range e.Tags {
-		if strings.Contains(strings.ToLower(tag), q) {
-			return true
-		}
-	}
-	return false
+	// Deterministic ordering for callers/tests.
+	sort.Slice(results, func(i, j int) bool { return results[i].Key < results[j].Key })
+	return results, nil
 }
 
 // Forget removes the stored entry for key from disk.
@@ -172,6 +281,10 @@ func (lt *LongTermMemory) Forget(key string) error {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 
+	if err := lt.ensureLoadedLocked(); err != nil {
+		return err
+	}
+
 	path := lt.entryPath(key)
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
@@ -179,6 +292,10 @@ func (lt *LongTermMemory) Forget(key string) error {
 		}
 		return fmt.Errorf("memory: forget %q: %w", key, err)
 	}
+
+	lt.idx.remove(key)
+	delete(lt.entries, key)
+
 	return nil
 }
 

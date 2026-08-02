@@ -15,9 +15,8 @@ StartLimitBurst=3
 Type=simple
 User=hyperi
 Group=hyperi
-# Phase 0/1: cobra CLI session start
-# Phase 2+: replace with 'hyperi' (persistent TUI shell)
-ExecStart=/usr/local/bin/hyperi session start --execute
+# hyperi serve starts the HTTP API server and background goal-processing loop.
+ExecStart=/usr/local/bin/hyperi serve
 WorkingDirectory=/var/lib/hyperi
 # API key loaded from environment file — do not hardcode in unit file
 # Set ANTHROPIC_API_KEY in /etc/hyperi/environment

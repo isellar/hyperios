@@ -1,11 +1,13 @@
 package io_toolbox_test
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/isellar/hyperios/internal/io_toolbox"
 	"github.com/isellar/hyperios/internal/io_toolbox/tools"
+	"github.com/isellar/hyperios/internal/selfmodify"
 )
 
 // ── ToolRegistry tests ────────────────────────────────────────────────────────
@@ -66,6 +68,26 @@ func TestToolRegistry_RegisterReplace(t *testing.T) {
 	if len(names) != 1 {
 		t.Errorf("expected 1 tool after replace, got %d", len(names))
 	}
+}
+
+func TestToolRegistry_Remove(t *testing.T) {
+	reg := io_toolbox.NewToolRegistry()
+	reg.Register(tools.NewShellTool())
+
+	reg.Remove("shell")
+
+	if _, ok := reg.Get("shell"); ok {
+		t.Error("expected shell tool to be removed")
+	}
+	if len(reg.List()) != 0 {
+		t.Errorf("expected empty registry after remove, got %d tools", len(reg.List()))
+	}
+}
+
+func TestToolRegistry_Remove_Missing(t *testing.T) {
+	reg := io_toolbox.NewToolRegistry()
+	// Must not panic on removing a tool that was never registered.
+	reg.Remove("ghost")
 }
 
 func TestToolRegistry_Execute_UnknownTool(t *testing.T) {
@@ -141,6 +163,34 @@ func TestIOToolbox_Capabilities(t *testing.T) {
 	if len(caps) == 0 {
 		t.Fatal("expected at least one capability")
 	}
+}
+
+func TestIOToolbox_SelfModify_NotRegisteredByDefault(t *testing.T) {
+	tb := io_toolbox.NewIOToolbox(nil)
+	if _, ok := tb.GetTool("self_modify"); ok {
+		t.Fatal("expected self_modify tool to NOT be registered by default (opt-in only)")
+	}
+}
+
+func TestIOToolbox_EnableDisableSelfModify(t *testing.T) {
+	tb := io_toolbox.NewIOToolbox(nil)
+	mgr := selfmodify.NewManager(t.TempDir(), filepath.Join(t.TempDir(), "hyperi"), selfmodify.Options{})
+
+	tb.EnableSelfModify(mgr)
+	if _, ok := tb.GetTool("self_modify"); !ok {
+		t.Fatal("expected self_modify tool to be registered after EnableSelfModify")
+	}
+
+	tb.DisableSelfModify()
+	if _, ok := tb.GetTool("self_modify"); ok {
+		t.Fatal("expected self_modify tool to be removed after DisableSelfModify")
+	}
+}
+
+func TestIOToolbox_DisableSelfModify_NeverEnabled(t *testing.T) {
+	tb := io_toolbox.NewIOToolbox(nil)
+	// Must not panic when disabling something that was never enabled.
+	tb.DisableSelfModify()
 }
 
 func TestIOToolbox_Name(t *testing.T) {

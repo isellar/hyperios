@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"io"
-	"os"
 	"strings"
 	"testing"
 
@@ -77,6 +75,24 @@ func testWire(t *testing.T) *Modules {
 	return mods
 }
 
+// allModules returns the named-module cases shared by the health/report/
+// capabilities/names tests below.
+func allModules(mods *Modules) []struct {
+	name string
+	mod  module.Module
+} {
+	return []struct {
+		name string
+		mod  module.Module
+	}{
+		{"goal_fulfillment", mods.GoalFulfillment},
+		{"processor", mods.Processor},
+		{"memory", mods.Memory},
+		{"self_improvement", mods.SelfImprovement},
+		{"io_toolbox", mods.IOToolbox},
+	}
+}
+
 // ── TestWireModules ───────────────────────────────────────────────────────────
 
 // TestWireModules verifies that WireModules returns a fully populated Modules
@@ -98,9 +114,6 @@ func TestWireModules(t *testing.T) {
 	if mods.GoalFulfillment == nil {
 		t.Error("GoalFulfillment is nil after wiring")
 	}
-	if mods.Governor == nil {
-		t.Error("Governor is nil after wiring")
-	}
 	if mods.Processor == nil {
 		t.Error("Processor is nil after wiring")
 	}
@@ -110,26 +123,21 @@ func TestWireModules(t *testing.T) {
 	if mods.SelfImprovement == nil {
 		t.Error("SelfImprovement is nil after wiring")
 	}
+	if mods.IOToolbox == nil {
+		t.Error("IOToolbox is nil after wiring")
+	}
+	if mods.ResultStore == nil {
+		t.Error("ResultStore is nil after wiring")
+	}
 }
 
 // ── TestModuleHealthAll ───────────────────────────────────────────────────────
 
-// TestModuleHealthAll verifies all 5 wired modules report "healthy" status.
+// TestModuleHealthAll verifies all wired modules report "healthy" status.
 func TestModuleHealthAll(t *testing.T) {
 	mods := testWire(t)
 
-	cases := []struct {
-		name string
-		mod  module.Module
-	}{
-		{"goal_fulfillment", mods.GoalFulfillment},
-		{"governor", mods.Governor},
-		{"processor", mods.Processor},
-		{"memory", mods.Memory},
-		{"self_improvement", mods.SelfImprovement},
-	}
-
-	for _, tc := range cases {
+	for _, tc := range allModules(mods) {
 		h := tc.mod.Health()
 		if h.Status != "healthy" {
 			t.Errorf("module %q: expected health %q, got %q (details: %s)",
@@ -144,9 +152,9 @@ func TestModuleHealthAll(t *testing.T) {
 // ── TestFullGoalPipeline ──────────────────────────────────────────────────────
 
 // TestFullGoalPipeline exercises the full goal path using a mock LLM client:
-//  1. GoalFulfillment.SubmitGoal  → creates a tracked Goal
-//  2. Processor.QueueGoal         → governor review (skipped — no governor on proc) + enqueue
-//  3. Processor.RunNext           → dequeue + agent spawn via mock LLM → AgentResult
+//  1. GoalFulfillment.SubmitGoal  — creates a tracked Goal
+//  2. Processor.QueueGoal         — enqueue (no policy layer in the MVP path)
+//  3. Processor.RunNext           — dequeue + agent spawn via mock LLM -> AgentResult
 //
 // The processor is constructed independently with a mock LLM client so no
 // real API calls occur.  GoalFulfillment is still the wired real instance so
@@ -169,7 +177,6 @@ func TestFullGoalPipeline(t *testing.T) {
 	mock := &mockCompleter{response: `{"output":"stub result","success":true}`}
 	proc := processor.NewProcessor(cfg, mock, auditLog)
 	proc.SetGoalFulfillment(mods.GoalFulfillment)
-	// No governor → governor review is skipped (QueueGoal proceeds).
 
 	// 1. Submit a goal.
 	goal, err := mods.GoalFulfillment.SubmitGoal("list files in /tmp")
@@ -195,38 +202,6 @@ func TestFullGoalPipeline(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("RunNext returned nil result")
-	}
-}
-
-// ── TestAppRunQuit ────────────────────────────────────────────────────────────
-
-// TestAppRunQuit creates an App and runs it with a pipe-backed stdin that
-// provides "quit\n", verifying a clean exit with no error.
-func TestAppRunQuit(t *testing.T) {
-	mods := testWire(t)
-	app := NewApp(mods)
-
-	// Replace os.Stdin with a reader that sends "quit" then EOF.
-	oldStdin := os.Stdin
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
-	}
-	os.Stdin = r
-	t.Cleanup(func() {
-		os.Stdin = oldStdin
-		r.Close()
-	})
-
-	// Write "quit\n" and close the write-end so bufio.Scanner sees EOF after.
-	if _, writeErr := io.WriteString(w, "quit\n"); writeErr != nil {
-		t.Fatalf("write quit to stdin pipe: %v", writeErr)
-	}
-	w.Close()
-
-	ctx := context.Background()
-	if runErr := app.Run(ctx); runErr != nil {
-		t.Fatalf("App.Run returned unexpected error: %v", runErr)
 	}
 }
 
@@ -258,18 +233,7 @@ func TestWireModules_DefaultsOnMissingConfig(t *testing.T) {
 func TestModuleCapabilities(t *testing.T) {
 	mods := testWire(t)
 
-	cases := []struct {
-		name string
-		mod  module.Module
-	}{
-		{"goal_fulfillment", mods.GoalFulfillment},
-		{"governor", mods.Governor},
-		{"processor", mods.Processor},
-		{"memory", mods.Memory},
-		{"self_improvement", mods.SelfImprovement},
-	}
-
-	for _, tc := range cases {
+	for _, tc := range allModules(mods) {
 		caps := tc.mod.Capabilities()
 		if len(caps) == 0 {
 			t.Errorf("module %q returned empty Capabilities()", tc.name)
@@ -289,20 +253,9 @@ func TestModuleCapabilities(t *testing.T) {
 func TestModuleNames(t *testing.T) {
 	mods := testWire(t)
 
-	cases := []struct {
-		mod  module.Module
-		want string
-	}{
-		{mods.GoalFulfillment, "goal_fulfillment"},
-		{mods.Governor, "governor"},
-		{mods.Processor, "processor"},
-		{mods.Memory, "memory"},
-		{mods.SelfImprovement, "self_improvement"},
-	}
-
-	for _, tc := range cases {
-		if got := tc.mod.Name(); got != tc.want {
-			t.Errorf("expected module name %q, got %q", tc.want, got)
+	for _, tc := range allModules(mods) {
+		if got := tc.mod.Name(); got != tc.name {
+			t.Errorf("expected module name %q, got %q", tc.name, got)
 		}
 	}
 }
